@@ -12,6 +12,7 @@ import postgres from "postgres";
 import Redis from "ioredis";
 import { SignJWT, jwtVerify } from "jose";
 import { gzipSync } from "node:zlib";
+import { readFileSync } from "node:fs";
 
 const PORT = Number(process.env.PORT || 3000);
 const DATABASE_URL = process.env.DATABASE_URL || "";
@@ -36,6 +37,7 @@ const sql = postgres(DATABASE_URL, {
   max: Number(process.env.PG_POOL_MAX || 25),
   idle_timeout: 20,
   connect_timeout: 10,
+  prepare: false,
 });
 
 const redis = new Redis(REDIS_URL, {
@@ -1098,9 +1100,75 @@ async function handleAdminControl(action: string, body: Record<string, any>): Pr
       return jsonRes({ message: "Flushed pending Redis earnings to PostgreSQL." });
     }
     if (action === "capacity_snapshot") {
-      const [{ users }] = await sql`select count(*)::integer as users from public.profiles`;
-      const pendingRedis = await redis.hlen("pending:captchas");
-      return jsonRes({ registered_users: users, pending_redis_users: pendingRedis });
+      let memTotalMb = 0, memAvailMb = 0, swapTotalMb = 0, swapFreeMb = 0;
+      try {
+        const memRaw = readFileSync("/proc/meminfo", "utf8");
+        const grab = (k: string) => {
+          const m = memRaw.match(new RegExp(`^${k}:\\s+(\\d+)`, "m"));
+          return m ? Math.round(Number(m[1]) / 1024) : 0;
+        };
+        memTotalMb = grab("MemTotal");
+        memAvailMb = grab("MemAvailable") || grab("MemFree");
+        swapTotalMb = grab("SwapTotal");
+        swapFreeMb = grab("SwapFree");
+      } catch {}
+
+      let diskTotalGb = 0, diskUsedGb = 0, diskFreeGb = 0, diskUsedPct = 0;
+      try {
+        const p = Bun.spawnSync(["df", "-k", "/app/scale-server.ts"]);
+        const lines = p.stdout.toString().trim().split(/\r?\n/);
+        const cols = (lines[lines.length - 1] || "").trim().split(/\s+/);
+        if (cols.length >= 5) {
+          diskTotalGb = Math.round(((Number(cols[1]) || 0) / 1048576) * 100) / 100;
+          diskUsedGb = Math.round(((Number(cols[2]) || 0) / 1048576) * 100) / 100;
+          diskFreeGb = Math.round(((Number(cols[3]) || 0) / 1048576) * 100) / 100;
+          diskUsedPct = Number(String(cols[4]).replace("%", "")) || 0;
+        }
+      } catch {}
+
+      const [[dbRow], [{ users }], [{ ledger_rows }], [appSet], pendingRedis, redisMemRaw] = await Promise.all([
+        sql`select pg_database_size(current_database())::bigint as size_bytes, pg_size_pretty(pg_database_size(current_database())) as size_pretty`,
+        sql`select count(*)::integer as users from public.profiles`,
+        sql`select count(*)::integer as ledger_rows from public.wallet_ledger`,
+        sql`select max_registered from public.app_settings where id = 1`,
+        redis.hlen("pending:captchas"),
+        redis.info("memory").catch(() => ""),
+      ]);
+
+      const maxReg = Number(appSet?.max_registered || 1000000);
+      const remainingReg = Math.max(0, maxReg - Number(users || 0));
+      const memUsedMb = Math.max(0, memTotalMb - memAvailMb);
+      const redisMemMatch = String(redisMemRaw || "").match(/used_memory_human:([^\r\n]+)/);
+      const capacity = {
+        server_ram: {
+          total_mb: memTotalMb,
+          used_mb: memUsedMb,
+          free_mb: memAvailMb,
+          used_pct: memTotalMb > 0 ? Math.round((memUsedMb / memTotalMb) * 100) : 0,
+          swap_total_mb: swapTotalMb,
+          swap_used_mb: Math.max(0, swapTotalMb - swapFreeMb),
+        },
+        disk_storage: {
+          total_gb: diskTotalGb,
+          used_gb: diskUsedGb,
+          free_gb: diskFreeGb,
+          used_pct: diskUsedPct,
+        },
+        database: {
+          size_bytes: Number(dbRow?.size_bytes || 0),
+          size_pretty: String(dbRow?.size_pretty || "0 MB"),
+          total_users: Number(users || 0),
+          max_registered: maxReg,
+          remaining_registrations: remainingReg,
+          ledger_rows: Number(ledger_rows || 0),
+        },
+        redis: {
+          used_memory: redisMemMatch ? redisMemMatch[1].trim() : "-",
+          pending_captcha_users: pendingRedis,
+        },
+        uptime_seconds: Math.round(process.uptime()),
+      };
+      return jsonRes({ registered_users: users, pending_redis_users: pendingRedis, capacity });
     }
 
     if (action === "list_tickets") {
