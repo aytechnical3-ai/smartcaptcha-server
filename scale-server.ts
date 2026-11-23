@@ -366,9 +366,15 @@ async function bootstrapAdmin() {
 bootstrapAdmin();
 
 async function isUserAdmin(user: { id: string; email: string; role: string }): Promise<boolean> {
-  if (user.role === "admin" || ADMIN_EMAILS.has(user.email.toLowerCase())) return true;
-  const rows = await sql`select is_admin from public.profiles where id = ${user.id} limit 1`;
-  return Boolean(rows[0]?.is_admin);
+  if (ADMIN_EMAILS.has(user.email.toLowerCase())) return true;
+  const rows = await sql`
+    select u.role, p.is_admin
+    from public.users u
+    left join public.profiles p on p.id = u.id
+    where u.id = ${user.id} limit 1
+  `;
+  if (!rows.length) return false;
+  return rows[0].role === "admin" || Boolean(rows[0].is_admin);
 }
 
 // ----------------------------------------------------------------------------
@@ -595,7 +601,7 @@ async function routeRequest(req: Request): Promise<Response> {
       if (!(await isUserAdmin(user))) {
         return jsonRes({ error: "Forbidden: Admin privileges required." }, 403);
       }
-      return await handleAdminControl(String(body.action || ""), body);
+      return await handleAdminControl(String(body.action || ""), body, user);
     }
 
     return jsonRes({ error: "Unknown endpoint" }, 404);
@@ -885,9 +891,13 @@ async function handleUserFinance(action: string, body: Record<string, any>, user
 }
 
 // ----------------------------------------------------------------------------
-// Admin Control Handlers (Supports all 43 actions in admin.html)
+// Admin Control Handlers
 // ----------------------------------------------------------------------------
-async function handleAdminControl(action: string, body: Record<string, any>): Promise<Response> {
+async function handleAdminControl(
+  action: string,
+  body: Record<string, any>,
+  adminUser: { id: string; email: string; role: string }
+): Promise<Response> {
   try {
     if (action === "get_settings") {
       const [[appSet], [wdCfg], [{ cnt }]] = await Promise.all([
@@ -938,9 +948,149 @@ async function handleAdminControl(action: string, body: Record<string, any>): Pr
     }
     if (action === "reset_user_password") {
       const pwd = String(body.password || "");
-      if (pwd.length < 8) return jsonRes({ error: "Minimum 8 chars." }, 400);
+      if (pwd.length < 8 || pwd.length > 128) return jsonRes({ error: "Password must be 8 to 128 characters." }, 400);
       await sql`update public.users set password_hash = ${await hashPassword(pwd)} where id = ${String(body.user_id)}`;
       return jsonRes({ message: "User password reset." });
+    }
+    if (action === "change_admin_password") {
+      const curPwd = String(body.current_password || "");
+      const newPwd = String(body.new_password || "");
+      if (!curPwd) return jsonRes({ error: "Enter your current password." }, 400);
+      if (newPwd.length < 8 || newPwd.length > 128) return jsonRes({ error: "New password must be 8 to 128 characters." }, 400);
+      const [me] = await sql`select id, password_hash from public.users where id = ${adminUser.id} limit 1`;
+      if (!me || !(await verifyPassword(curPwd, me.password_hash))) {
+        return jsonRes({ error: "Current password is incorrect." }, 400);
+      }
+      await sql`update public.users set password_hash = ${await hashPassword(newPwd)} where id = ${adminUser.id}`;
+      return jsonRes({ message: "Your Admin Panel password has been updated. Use the new password on next login." });
+    }
+    if (action === "list_admins") {
+      const envList = Array.from(ADMIN_EMAILS);
+      const admins = await sql`
+        select u.id, u.email, u.role, u.created_at,
+               coalesce(p.full_name, '') as full_name,
+               coalesce(p.is_admin, false) as is_admin,
+               coalesce(p.account_status, 'active') as account_status
+        from public.users u
+        left join public.profiles p on p.id = u.id
+        where u.role = 'admin'
+           or coalesce(p.is_admin, false) = true
+           or (${envList.length > 0} and lower(u.email) = any(${envList}))
+        order by u.created_at asc
+      `;
+      return jsonRes({
+        admins: admins.map((a: any) => ({
+          id: a.id,
+          email: a.email,
+          full_name: a.full_name,
+          role: a.role,
+          account_status: a.account_status,
+          created_at: a.created_at,
+          is_env_root: ADMIN_EMAILS.has(String(a.email || "").toLowerCase()),
+          is_self: a.id === adminUser.id,
+        })),
+      });
+    }
+    if (action === "grant_admin") {
+      const raw = String(body.target || body.user_id || body.email || "").trim();
+      const pwd = String(body.password || "");
+      const fullName = String(body.full_name || "").trim();
+      if (!raw) return jsonRes({ error: "Enter a User ID (UUID) or Email address." }, 400);
+      if (pwd && (pwd.length < 8 || pwd.length > 128)) {
+        return jsonRes({ error: "Password must be 8 to 128 characters." }, 400);
+      }
+      const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(raw);
+      const foundRows = isUuid
+        ? await sql`select id, email, role from public.users where id = ${raw} limit 1`
+        : await sql`select id, email, role from public.users where lower(email) = ${raw.toLowerCase()} limit 1`;
+
+      if (foundRows.length) {
+        const target = foundRows[0];
+        if (pwd) {
+          await sql`update public.users set role = 'admin', password_hash = ${await hashPassword(pwd)} where id = ${target.id}`;
+        } else {
+          await sql`update public.users set role = 'admin' where id = ${target.id}`;
+        }
+        const [prof] = await sql`select id from public.profiles where id = ${target.id} limit 1`;
+        if (prof) {
+          await sql`
+            update public.profiles
+            set is_admin = true,
+                account_status = 'active',
+                full_name = coalesce(${fullName || null}, full_name)
+            where id = ${target.id}
+          `;
+        } else {
+          await sql`
+            insert into public.profiles (id, email, full_name, referral_code, account_status, is_admin)
+            values (${target.id}, ${target.email}, ${fullName || "Admin"}, ${"ADM" + randomCode(5)}, 'active', true)
+          `;
+        }
+        return jsonRes({
+          message: `Admin panel access linked to ${target.email}${pwd ? " (with new password)" : ""}.`,
+          admin: { id: target.id, email: target.email },
+        });
+      }
+
+      if (isUuid || !raw.includes("@")) {
+        return jsonRes({ error: "User ID not found. Enter a valid registered User UUID or an Email + Password." }, 404);
+      }
+      if (!pwd) {
+        return jsonRes({ error: "This email is not registered yet. Enter a password (min 8 chars) to create a new admin account." }, 400);
+      }
+      const emailLower = raw.toLowerCase();
+      const [created] = await sql`
+        insert into public.users (email, password_hash, role)
+        values (${emailLower}, ${await hashPassword(pwd)}, 'admin')
+        returning id, email
+      `;
+      await sql`
+        insert into public.profiles (id, email, full_name, referral_code, account_status, is_admin)
+        values (${created.id}, ${created.email}, ${fullName || "Admin"}, ${"ADM" + randomCode(5)}, 'active', true)
+      `;
+      return jsonRes({
+        message: `New Admin account created and granted access: ${created.email}`,
+        admin: { id: created.id, email: created.email },
+      });
+    }
+    if (action === "update_admin_password") {
+      const targetId = String(body.user_id || "").trim();
+      const newPwd = String(body.new_password || body.password || "");
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(targetId)) {
+        return jsonRes({ error: "Valid admin User ID is required." }, 400);
+      }
+      if (newPwd.length < 8 || newPwd.length > 128) {
+        return jsonRes({ error: "New password must be 8 to 128 characters." }, 400);
+      }
+      const [target] = await sql`
+        select u.id, u.email, u.role, coalesce(p.is_admin, false) as is_admin
+        from public.users u
+        left join public.profiles p on p.id = u.id
+        where u.id = ${targetId} limit 1
+      `;
+      if (!target) return jsonRes({ error: "Admin account not found." }, 404);
+      if (target.role !== "admin" && !target.is_admin && !ADMIN_EMAILS.has(String(target.email || "").toLowerCase())) {
+        return jsonRes({ error: "Selected user does not have admin access." }, 400);
+      }
+      await sql`update public.users set password_hash = ${await hashPassword(newPwd)} where id = ${target.id}`;
+      return jsonRes({ message: `Admin password updated for ${target.email}.` });
+    }
+    if (action === "revoke_admin") {
+      const targetId = String(body.user_id || "").trim();
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(targetId)) {
+        return jsonRes({ error: "Valid admin User ID is required." }, 400);
+      }
+      if (targetId === adminUser.id) {
+        return jsonRes({ error: "You cannot remove your own currently signed-in admin access." }, 400);
+      }
+      const [target] = await sql`select id, email from public.users where id = ${targetId} limit 1`;
+      if (!target) return jsonRes({ error: "Admin account not found." }, 404);
+      if (ADMIN_EMAILS.has(String(target.email || "").toLowerCase())) {
+        return jsonRes({ error: "Root admin configured in server .env cannot be removed from panel." }, 403);
+      }
+      await sql`update public.users set role = 'user' where id = ${target.id}`;
+      await sql`update public.profiles set is_admin = false where id = ${target.id}`;
+      return jsonRes({ message: `Admin access removed from ${target.email}.` });
     }
     if (action === "update_user_profile") {
       await sql`
