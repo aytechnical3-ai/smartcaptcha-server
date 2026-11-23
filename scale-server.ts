@@ -29,13 +29,13 @@ const ADMIN_EMAILS = new Set(
 const BOOTSTRAP_ADMIN_EMAIL = (process.env.ADMIN_EMAIL || "").trim().toLowerCase();
 const BOOTSTRAP_ADMIN_PASSWORD = (process.env.ADMIN_PASSWORD || "").trim();
 const USDT_INR_RATE = 100;
-const FLUSH_INTERVAL_MS = Number(process.env.FLUSH_INTERVAL_MS || 30000);
+const FLUSH_INTERVAL_MS = Number(process.env.FLUSH_INTERVAL_MS || 60000);
 
 if (!DATABASE_URL) throw new Error("DATABASE_URL is required");
 
 const sql = postgres(DATABASE_URL, {
-  max: Number(process.env.PG_POOL_MAX || 25),
-  idle_timeout: 20,
+  max: Number(process.env.PG_POOL_MAX || 20),
+  idle_timeout: 15,
   connect_timeout: 10,
   prepare: false,
 });
@@ -199,41 +199,59 @@ function todayIst(): string {
 }
 
 // ----------------------------------------------------------------------------
-// Redis -> PostgreSQL Batch Flush Worker
+// Redis -> PostgreSQL Batch Flush Worker (with Orphan Recovery & Mutex Wait)
 // ----------------------------------------------------------------------------
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 let flushing = false;
-async function flushPendingCaptchas(): Promise<{ users: number; captchas: number }> {
-  if (flushing) return { users: 0, captchas: 0 };
-  flushing = true;
-  try {
-    const exists = await redis.exists("pending:captchas");
-    if (!exists) return { users: 0, captchas: 0 };
-    const processingKey = `pending:captchas:flush:${Date.now()}:${Math.random().toString(36).slice(2, 7)}`;
-    try { await redis.rename("pending:captchas", processingKey); } catch { return { users: 0, captchas: 0 }; }
+let activeFlushPromise: Promise<{ users: number; captchas: number }> | null = null;
 
-    const rawMap = await redis.hgetall(processingKey);
-    const payload: Array<{ user_id: string; solved: number; reward_usdt: number }> = [];
-    for (const [userId, val] of Object.entries(rawMap)) {
-      const [cntStr, usdtStr] = String(val).split(":");
-      const solved = Number(cntStr || 0);
-      const rewardUsdt = Number(usdtStr || 0);
-      if (solved > 0) payload.push({ user_id: userId, solved, reward_usdt: Math.round(rewardUsdt * 10000) / 10000 });
-    }
-    let totalUsers = 0, totalCaptchas = 0;
-    for (let i = 0; i < payload.length; i += 1000) {
-      const chunk = payload.slice(i, i + 1000);
-      const res = await sql`select public.batch_credit_captchas(${JSON.stringify(chunk)}::jsonb) as res`;
-      totalUsers += Number(res[0]?.res?.users || 0);
-      totalCaptchas += Number(res[0]?.res?.captchas || 0);
-    }
-    await redis.del(processingKey);
-    return { users: totalUsers, captchas: totalCaptchas };
-  } catch (err) {
-    console.error("[flushPendingCaptchas error]", err);
-    return { users: 0, captchas: 0 };
-  } finally {
-    flushing = false;
+async function processFlushHashKey(processingKey: string): Promise<{ users: number; captchas: number }> {
+  const rawMap = await redis.hgetall(processingKey);
+  const payload: Array<{ user_id: string; solved: number; reward_usdt: number }> = [];
+  for (const [userId, val] of Object.entries(rawMap)) {
+    if (!UUID_RE.test(userId)) continue;
+    const [cntStr, usdtStr] = String(val).split(":");
+    const solved = Number(cntStr || 0);
+    const rewardUsdt = Number(usdtStr || 0);
+    if (solved > 0) payload.push({ user_id: userId, solved, reward_usdt: Math.round(rewardUsdt * 10000) / 10000 });
   }
+  let totalUsers = 0, totalCaptchas = 0;
+  for (let i = 0; i < payload.length; i += 1000) {
+    const chunk = payload.slice(i, i + 1000);
+    const res = await sql`select public.batch_credit_captchas(${JSON.stringify(chunk)}::jsonb) as res`;
+    totalUsers += Number(res[0]?.res?.users || 0);
+    totalCaptchas += Number(res[0]?.res?.captchas || 0);
+  }
+  await redis.del(processingKey);
+  return { users: totalUsers, captchas: totalCaptchas };
+}
+
+async function flushPendingCaptchas(): Promise<{ users: number; captchas: number }> {
+  if (flushing && activeFlushPromise) return await activeFlushPromise;
+  flushing = true;
+  activeFlushPromise = (async () => {
+    try {
+      // Recover any orphaned flush keys older than current run
+      const orphans = await redis.keys("pending:captchas:flush:*").catch(() => []);
+      for (const k of orphans.slice(0, 5)) {
+        try { await processFlushHashKey(k); } catch (e) { console.error("[orphan flush retry]", e); }
+      }
+
+      const exists = await redis.exists("pending:captchas");
+      if (!exists) return { users: 0, captchas: 0 };
+      const processingKey = `pending:captchas:flush:${Date.now()}:${Math.random().toString(36).slice(2, 7)}`;
+      try { await redis.rename("pending:captchas", processingKey); } catch { return { users: 0, captchas: 0 }; }
+
+      return await processFlushHashKey(processingKey);
+    } catch (err) {
+      console.error("[flushPendingCaptchas error]", err);
+      return { users: 0, captchas: 0 };
+    } finally {
+      flushing = false;
+      activeFlushPromise = null;
+    }
+  })();
+  return await activeFlushPromise;
 }
 
 setInterval(() => { flushPendingCaptchas().catch(() => {}); }, FLUSH_INTERVAL_MS);
@@ -329,6 +347,50 @@ async function getCachedAppSettings() {
   );
 }
 
+// Fast O(1) count for large tables (uses Redis cache + pg_class reltuples above 5k rows)
+async function getFastRowCount(table: "users" | "profiles" | "wallet_ledger", cacheKey: string, ttlSec = 20): Promise<number> {
+  const cached = await redis.get(cacheKey);
+  if (cached !== null && Number.isFinite(Number(cached))) return Number(cached);
+  const fullTable = `public.${table}`;
+  const [estRow] = await sql`select greatest(0, coalesce(reltuples::bigint, 0))::bigint as est from pg_class where oid = ${fullTable}::regclass`;
+  const est = Number(estRow?.est || 0);
+  let count = est;
+  if (est < 5000) {
+    if (table === "users") {
+      const [r] = await sql`select count(*)::integer as cnt from public.users`;
+      count = Number(r?.cnt || 0);
+    } else if (table === "profiles") {
+      const [r] = await sql`select count(*)::integer as cnt from public.profiles`;
+      count = Number(r?.cnt || 0);
+    } else {
+      const [r] = await sql`select count(*)::bigint as cnt from public.wallet_ledger`;
+      count = Number(r?.cnt || 0);
+    }
+  }
+  await redis.set(cacheKey, String(count), "EX", ttlSec);
+  return count;
+}
+
+const LUA_INCR_IF_EXISTS = `if redis.call("EXISTS", KEYS[1]) == 1 then return redis.call("INCR", KEYS[1]) end return 0`;
+function safeIncrIfCached(cacheKey: string) {
+  redis.eval(LUA_INCR_IF_EXISTS, 1, cacheKey).catch(() => {});
+}
+
+async function ensurePerformanceIndexes() {
+  try {
+    await Promise.all([
+      sql`create index if not exists idx_profiles_created_at on public.profiles(created_at desc)`,
+      sql`create index if not exists idx_profiles_email_lower on public.profiles(lower(email))`,
+      sql`create index if not exists idx_users_email_lower on public.users(lower(email))`,
+      sql`create index if not exists idx_deposits_status_id on public.deposits(status, id desc)`,
+      sql`create index if not exists idx_withdrawals_status_id on public.withdrawal_requests(status, id desc)`,
+    ]);
+  } catch (e) {
+    console.error("[ensurePerformanceIndexes]", e);
+  }
+}
+ensurePerformanceIndexes();
+
 async function issueCaptchaChallenge(userId: string) {
   const code = randomCode(6);
   const token = await signCaptchaToken({
@@ -399,12 +461,12 @@ async function handleAuth(pathname: string, req: Request): Promise<Response> {
     if (appSet && !appSet.registration_open) {
       return jsonRes({ error: "Registrations are currently closed by admin." }, 403);
     }
-    const [{ cnt }] = await sql`select count(*)::integer as cnt from public.users`;
+    const cnt = await getFastRowCount("users", "cache:users_count", 20);
     if (appSet && cnt >= Number(appSet.max_registered)) {
       return jsonRes({ error: "Registration limit reached." }, 403);
     }
 
-    const dup = await sql`select id from public.users where email = ${email} limit 1`;
+    const dup = await sql`select id from public.users where lower(email) = ${email} limit 1`;
     if (dup.length) return jsonRes({ error: "Account already registered. Please log in." }, 400);
 
     const pwdHash = await hashPassword(password);
@@ -419,6 +481,8 @@ async function handleAuth(pathname: string, req: Request): Promise<Response> {
       insert into public.profiles (id, email, referral_code, account_status, is_admin)
       values (${u.id}, ${u.email}, ${"SC" + randomCode(6)}, 'active', ${isAdmin})
     `;
+    safeIncrIfCached("cache:users_count");
+    safeIncrIfCached("cache:reg_count");
 
     const access_token = await issueJwt({ id: u.id, email: u.email, role: u.role });
     return jsonRes({ user: u, session: { access_token, user: u } });
@@ -434,12 +498,16 @@ async function handleAuth(pathname: string, req: Request): Promise<Response> {
     if (!(await verifyTurnstile(body.captchaToken))) {
       return jsonRes({ error: "Human verification failed. Please retry." }, 400);
     }
-    const [u] = await sql`select id, email, password_hash, role from public.users where email = ${email} limit 1`;
+    const [u] = await sql`
+      select u.id, u.email, u.password_hash, u.role, p.account_status
+      from public.users u
+      left join public.profiles p on p.id = u.id
+      where lower(u.email) = ${email} limit 1
+    `;
     if (!u || !(await verifyPassword(password, u.password_hash))) {
       return jsonRes({ error: "Invalid login credentials." }, 401);
     }
-    const [prof] = await sql`select account_status from public.profiles where id = ${u.id} limit 1`;
-    if (prof?.account_status === "blocked") {
+    if (u.account_status === "blocked") {
       return jsonRes({ error: "Account is blocked by admin." }, 403);
     }
     const access_token = await issueJwt({ id: u.id, email: u.email, role: u.role });
@@ -507,10 +575,7 @@ async function routeRequest(req: Request): Promise<Response> {
 
     // Public RPCs
     if (path === "/api/rpc/public_registration_count") {
-      const cached = await redis.get("cache:reg_count");
-      if (cached !== null) return jsonRes({ data: Number(cached) });
-      const [{ cnt }] = await sql`select count(*)::integer as cnt from public.profiles`;
-      await redis.set("cache:reg_count", String(cnt), "EX", 30);
+      const cnt = await getFastRowCount("profiles", "cache:reg_count", 30);
       return jsonRes({ data: cnt });
     }
 
@@ -547,8 +612,10 @@ async function routeRequest(req: Request): Promise<Response> {
     // register-device
     if (path === "/api/functions/register-device") {
       const deviceToken = String(body.device_token || "").trim();
-      const [appSet] = await sql`select device_lock_enabled from public.app_settings where id = 1`;
-      const [prof] = await sql`select * from public.profiles where id = ${user.id} limit 1`;
+      const [appSet, [prof]] = await Promise.all([
+        getCachedAppSettings(),
+        sql`select * from public.profiles where id = ${user.id} limit 1`,
+      ]);
       if (!prof) return jsonRes({ error: "Profile not found." }, 404);
       if (prof.account_status === "blocked") {
         return jsonRes({ error: "Account blocked by admin.", code: "DEVICE_LOCKED" }, 403);
@@ -619,8 +686,8 @@ const server = Bun.serve({
       (ct.includes("application/json") || ct.includes("image/svg+xml"))
     ) {
       const raw = new Uint8Array(await res.arrayBuffer());
-      if (raw.byteLength >= 320) {
-        const gz = gzipSync(raw, { level: 6 });
+      if (raw.byteLength >= 1024) {
+        const gz = gzipSync(raw, { level: 4 });
         const headers = new Headers(res.headers);
         headers.set("Content-Encoding", "gzip");
         headers.set("Vary", "Accept-Encoding");
@@ -787,7 +854,7 @@ async function handleUserFinance(action: string, body: Record<string, any>, user
       await flushPendingCaptchas();
       const amountInr = Number(body.amount_inr);
       if (!Number.isFinite(amountInr) || amountInr <= 0) return jsonRes({ error: "Enter a valid plan amount." }, 400);
-      const [settings] = await sql`select * from public.compounding_settings where id = 1`;
+      const settings = await getCachedCompoundingSettings();
       if (!settings?.enabled) return jsonRes({ error: "Compounding plan is currently paused by admin." }, 400);
 
       const allowed: number[] = (settings.allowed_amounts_inr || []).map(Number);
@@ -840,7 +907,7 @@ async function handleUserFinance(action: string, body: Record<string, any>, user
     }
 
     if (action === "compounding_early_exit") {
-      const [settings] = await sql`select * from public.compounding_settings where id = 1`;
+      const settings = await getCachedCompoundingSettings();
       if (!settings?.early_exit_enabled) return jsonRes({ error: "Early exit disabled by admin." }, 403);
       const [plan] = await sql`
         select * from public.compounding_plans
@@ -900,10 +967,10 @@ async function handleAdminControl(
 ): Promise<Response> {
   try {
     if (action === "get_settings") {
-      const [[appSet], [wdCfg], [{ cnt }]] = await Promise.all([
-        sql`select * from public.app_settings where id = 1`,
-        sql`select * from public.public_withdraw_config where id = 1`,
-        sql`select count(*)::integer as cnt from public.profiles`,
+      const [appSet, wdCfg, cnt] = await Promise.all([
+        getCachedAppSettings(),
+        getCachedWithdrawConfig(),
+        getFastRowCount("profiles", "cache:reg_count", 15),
       ]);
       return jsonRes({
         settings: appSet,
@@ -1160,26 +1227,31 @@ async function handleAdminControl(
 
     if (action === "set_levels") {
       await sql`update public.app_settings set level_count = ${Number(body.level_count)}, level_income = ${JSON.stringify(body.level_income || [])}::jsonb where id = 1`;
+      await redis.del("cache:app_settings");
       return jsonRes({ message: "Level settings saved." });
     }
     if (action === "set_device_lock") {
       await sql`update public.app_settings set device_lock_enabled = ${Boolean(body.enabled)} where id = 1`;
+      await redis.del("cache:app_settings");
       return jsonRes({ message: "Device lock updated." });
     }
     if (action === "set_registration") {
       await sql`update public.app_settings set registration_open = ${Boolean(body.open)} where id = 1`;
+      await redis.del("cache:app_settings");
       return jsonRes({ message: "Registration status updated." });
     }
     if (action === "set_registration_limit") {
       await sql`update public.app_settings set max_registered = ${Number(body.max_registered)} where id = 1`;
+      await redis.del("cache:app_settings");
       return jsonRes({ message: "Registration limit updated." });
     }
     if (action === "get_captcha_mode") {
-      const [s] = await sql`select captcha_mode from public.app_settings where id = 1`;
+      const s = await getCachedAppSettings();
       return jsonRes({ mode: s?.captcha_mode || "standard" });
     }
     if (action === "set_captcha_mode") {
       await sql`update public.app_settings set captcha_mode = ${String(body.mode || "standard")} where id = 1`;
+      await redis.del("cache:app_settings");
       return jsonRes({ message: "Captcha mode updated." });
     }
 
@@ -1276,11 +1348,11 @@ async function handleAdminControl(
         }
       } catch {}
 
-      const [[dbRow], [{ users }], [{ ledger_rows }], [appSet], pendingRedis, redisMemRaw] = await Promise.all([
+      const [[dbRow], users, ledger_rows, appSet, pendingRedis, redisMemRaw] = await Promise.all([
         sql`select pg_database_size(current_database())::bigint as size_bytes, pg_size_pretty(pg_database_size(current_database())) as size_pretty`,
-        sql`select count(*)::integer as users from public.profiles`,
-        sql`select count(*)::integer as ledger_rows from public.wallet_ledger`,
-        sql`select max_registered from public.app_settings where id = 1`,
+        getFastRowCount("profiles", "cache:reg_count", 15),
+        getFastRowCount("wallet_ledger", "cache:ledger_count", 15),
+        getCachedAppSettings(),
         redis.hlen("pending:captchas"),
         redis.info("memory").catch(() => ""),
       ]);
