@@ -34,8 +34,9 @@ const FLUSH_INTERVAL_MS = Number(process.env.FLUSH_INTERVAL_MS || 60000);
 if (!DATABASE_URL) throw new Error("DATABASE_URL is required");
 
 const sql = postgres(DATABASE_URL, {
-  max: Number(process.env.PG_POOL_MAX || 20),
-  idle_timeout: 15,
+  max: Number(process.env.PG_POOL_MAX || 15),
+  idle_timeout: 10,
+  max_lifetime: 1800,
   connect_timeout: 10,
   prepare: false,
 });
@@ -52,9 +53,14 @@ const CORS_HEADERS: Record<string, string> = {
 };
 
 function jsonRes(data: unknown, status = 200): Response {
-  return new Response(JSON.stringify(data), {
+  const body = JSON.stringify(data);
+  return new Response(body, {
     status,
-    headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+    headers: {
+      ...CORS_HEADERS,
+      "Content-Type": "application/json",
+      "Content-Length": String(Buffer.byteLength(body)),
+    },
   });
 }
 
@@ -680,10 +686,11 @@ const server = Bun.serve({
     const res = await routeRequest(req);
     const ae = req.headers.get("accept-encoding") || "";
     const ct = res.headers.get("content-type") || "";
+    const cl = Number(res.headers.get("content-length") || 0);
     if (
       ae.includes("gzip") &&
       !res.headers.has("content-encoding") &&
-      (ct.includes("application/json") || ct.includes("image/svg+xml"))
+      (ct.includes("image/svg+xml") || (ct.includes("application/json") && (cl === 0 || cl >= 1024)))
     ) {
       const raw = new Uint8Array(await res.arrayBuffer());
       if (raw.byteLength >= 1024) {
