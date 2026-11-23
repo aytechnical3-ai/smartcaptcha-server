@@ -1,0 +1,99 @@
+# ==============================================================================
+# SmartCaptcha — Complete Hetzner Production Stack (₹560/month Fixed)
+# Includes:
+#   - api (Bun + scale-server.ts — Auth, Captcha Redis Engine, Admin & Finance)
+#   - pgbouncer (Connection pooler for auto-scale / high concurrency)
+#   - db (PostgreSQL 16 tuned for 4 GB RAM NVMe VPS + hetzner_full_schema.sql)
+#   - redis (Valkey 8 in-memory store for 100k+ captcha ops/sec)
+#
+# Start on Hetzner VPS:
+#   docker compose -f docker-compose.scale.yml up -d
+# ==============================================================================
+
+services:
+  api:
+    image: oven/bun:1-alpine
+    working_dir: /app
+    command: sh -c "[ -d node_modules/postgres ] || bun add postgres ioredis jose; exec bun run scale-server.ts"
+    volumes:
+      - ./scale-server.ts:/app/scale-server.ts:ro
+      - bun_modules:/app/node_modules
+    ports:
+      - "80:3000"
+      - "3000:3000"
+    environment:
+      PORT: "3000"
+      DATABASE_URL: "postgres://postgres:${POSTGRES_PASSWORD}@pgbouncer:6432/smartcaptcha"
+      REDIS_URL: "redis://redis:6379"
+      JWT_SECRET: "${JWT_SECRET}"
+      CAPTCHA_HMAC_SECRET: "${CAPTCHA_HMAC_SECRET}"
+      TURNSTILE_SECRET_KEY: "${TURNSTILE_SECRET_KEY:-}"
+      ADMIN_EMAILS: "${ADMIN_EMAILS:-ak84839100@gmail.com}"
+      ADMIN_EMAIL: "${ADMIN_EMAIL:-ak84839100@gmail.com}"
+      ADMIN_PASSWORD: "${ADMIN_PASSWORD:-}"
+      PG_POOL_MAX: "20"
+      FLUSH_INTERVAL_MS: "30000"
+    depends_on:
+      pgbouncer:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    environment:
+      DATABASE_URL: "postgres://postgres:${POSTGRES_PASSWORD}@db:5432/smartcaptcha"
+      POOL_MODE: "transaction"
+      MAX_CLIENT_CONN: "1000"
+      DEFAULT_POOL_SIZE: "40"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: "smartcaptcha"
+      POSTGRES_USER: "postgres"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+    command: >
+      postgres
+      -c shared_buffers=${PG_SHARED_BUFFERS:-512MB}
+      -c effective_cache_size=${PG_EFFECTIVE_CACHE:-1536MB}
+      -c work_mem=${PG_WORK_MEM:-4MB}
+      -c max_connections=150
+      -c synchronous_commit=on
+      -c wal_buffers=16MB
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./hetzner_full_schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d smartcaptcha"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: valkey/valkey:8-alpine
+    command: valkey-server --appendonly yes --maxmemory ${REDIS_MAXMEMORY:-512mb} --maxmemory-policy noeviction
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  pg_data:
+  redis_data:
+  bun_modules:
