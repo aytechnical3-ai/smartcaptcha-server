@@ -13,12 +13,15 @@ import Redis from "ioredis";
 import { SignJWT, jwtVerify } from "jose";
 import { gzipSync } from "node:zlib";
 import { readFileSync } from "node:fs";
+import { randomBytes, createHash, createHmac } from "node:crypto";
 
 const PORT = Number(process.env.PORT || 3000);
 const DATABASE_URL = process.env.DATABASE_URL || "";
 const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
-const JWT_SECRET = process.env.JWT_SECRET || "change-this-32char-jwt-secret";
-const CAPTCHA_HMAC_SECRET = process.env.CAPTCHA_HMAC_SECRET || JWT_SECRET;
+const EPHEMERAL_SECRET = randomBytes(32).toString("hex");
+const ENV_JWT = (process.env.JWT_SECRET || "").trim();
+const JWT_SECRET = ENV_JWT.length >= 24 && !ENV_JWT.includes("change-this") ? ENV_JWT : EPHEMERAL_SECRET;
+const CAPTCHA_HMAC_SECRET = (process.env.CAPTCHA_HMAC_SECRET || "").trim() || createHash("sha256").update("cap:" + JWT_SECRET).digest("hex");
 const TURNSTILE_SECRET_KEY = process.env.TURNSTILE_SECRET_KEY || "";
 const ADMIN_EMAILS = new Set(
   (process.env.ADMIN_EMAILS || process.env.ADMIN_EMAIL || "ak84839100@gmail.com")
@@ -30,6 +33,13 @@ const BOOTSTRAP_ADMIN_EMAIL = (process.env.ADMIN_EMAIL || "").trim().toLowerCase
 const BOOTSTRAP_ADMIN_PASSWORD = (process.env.ADMIN_PASSWORD || "").trim();
 const USDT_INR_RATE = 100;
 const FLUSH_INTERVAL_MS = Number(process.env.FLUSH_INTERVAL_MS || 60000);
+
+const EXTRA_ORIGINS = new Set(
+  (process.env.ALLOWED_ORIGINS || "https://smartcaptcha-site.pages.dev,https://13-206-72-86.sslip.io")
+    .split(",")
+    .map((s) => s.trim().replace(/\/+$/, "").toLowerCase())
+    .filter(Boolean)
+);
 
 if (!DATABASE_URL) throw new Error("DATABASE_URL is required");
 
@@ -46,22 +56,66 @@ const redis = new Redis(REDIS_URL, {
   enableReadyCheck: true,
 });
 
-const CORS_HEADERS: Record<string, string> = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+function isAllowedOrigin(origin: string): boolean {
+  const o = origin.trim().replace(/\/+$/, "").toLowerCase();
+  if (!o) return false;
+  if (EXTRA_ORIGINS.has(o)) return true;
+  if (/^https:\/\/[a-z0-9-]+\.smartcaptcha-site\.pages\.dev$/i.test(o)) return true;
+  if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(o)) return true;
+  return false;
+}
+
+const SECURITY_HEADERS: Record<string, string> = {
+  "X-Content-Type-Options": "nosniff",
+  "X-Frame-Options": "DENY",
+  "Referrer-Policy": "no-referrer",
+  "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=()",
+  "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+  "Cache-Control": "no-store, no-cache, must-revalidate",
 };
 
-function jsonRes(data: unknown, status = 200): Response {
+function buildCorsHeaders(req?: Request): Record<string, string> {
+  const origin = req?.headers.get("origin") || "";
+  const allowOrigin = origin && isAllowedOrigin(origin) ? origin : "https://smartcaptcha-site.pages.dev";
+  return {
+    "Access-Control-Allow-Origin": allowOrigin,
+    "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type, x-device-token",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Vary": "Origin",
+    ...SECURITY_HEADERS,
+  };
+}
+
+function jsonRes(data: unknown, status = 200, req?: Request): Response {
   const body = JSON.stringify(data);
   return new Response(body, {
     status,
     headers: {
-      ...CORS_HEADERS,
+      ...buildCorsHeaders(req),
       "Content-Type": "application/json",
       "Content-Length": String(Buffer.byteLength(body)),
     },
   });
+}
+
+function sha256Hex(v: string): string {
+  return createHash("sha256").update(v).digest("hex");
+}
+
+function maskIp(ip: string): string {
+  if (!ip || ip === "unknown") return "unknown";
+  if (ip.includes(".")) {
+    const p = ip.split(".");
+    if (p.length === 4) return `${p[0]}.${p[1]}.xxx.xxx`;
+  }
+  if (ip.includes(":")) return ip.split(":").slice(0, 3).join(":") + ":xxxx";
+  return "masked";
+}
+
+function deviceFingerprint(rawToken: string): string {
+  const t = String(rawToken || "").trim();
+  if (t.length < 12) return "";
+  return sha256Hex("dfp:" + t).slice(0, 32);
 }
 
 const enc = new TextEncoder();
@@ -78,7 +132,7 @@ async function getHmacKey(): Promise<CryptoKey> {
   return cachedHmacKey;
 }
 
-// PBKDF2-SHA256 Password Hashing (Zero native dependency)
+// PBKDF2-SHA256 Password & PIN Hashing
 async function hashPassword(password: string): Promise<string> {
   const salt = crypto.getRandomValues(new Uint8Array(16));
   const key = await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveBits"]);
@@ -88,22 +142,94 @@ async function hashPassword(password: string): Promise<string> {
 }
 
 async function verifyPassword(password: string, stored: string): Promise<boolean> {
-  const parts = stored.split("$");
+  const parts = String(stored || "").split("$");
   if (parts.length !== 3 || parts[0] !== "pbkdf2") return false;
   const fromHex = (h: string) => new Uint8Array(h.match(/.{1,2}/g)!.map((b) => parseInt(b, 16)));
   const salt = fromHex(parts[1]);
   const key = await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveBits"]);
   const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", salt, iterations: 100000, hash: "SHA-256" }, key, 256);
   const actualHex = Array.from(new Uint8Array(bits)).map((x) => x.toString(16).padStart(2, "0")).join("");
-  return actualHex === parts[2];
+  return constantTimeEqual(actualHex, parts[2]);
 }
 
-async function issueJwt(user: { id: string; email: string; role: string }): Promise<string> {
-  return await new SignJWT({ email: user.email, role: user.role })
+// RFC 6238 TOTP (Google Authenticator / Authy compatible)
+const BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+function generateBase32Secret(len = 20): string {
+  const rnd = randomBytes(len);
+  let out = "";
+  for (let i = 0; i < rnd.length; i++) out += BASE32_ALPHABET[rnd[i] % 32];
+  return out;
+}
+function base32ToBuffer(b32: string): Buffer {
+  const clean = b32.toUpperCase().replace(/[^A-Z2-7]/g, "");
+  let bits = 0, value = 0;
+  const bytes: number[] = [];
+  for (const ch of clean) {
+    const idx = BASE32_ALPHABET.indexOf(ch);
+    if (idx < 0) continue;
+    value = (value << 5) | idx;
+    bits += 5;
+    if (bits >= 8) {
+      bytes.push((value >>> (bits - 8)) & 255);
+      bits -= 8;
+    }
+  }
+  return Buffer.from(bytes);
+}
+function totpForStep(secret: string, step: number): string {
+  const key = base32ToBuffer(secret);
+  const msg = Buffer.alloc(8);
+  msg.writeUInt32BE(Math.floor(step / 0x100000000), 0);
+  msg.writeUInt32BE(step >>> 0, 4);
+  const hmac = createHmac("sha1", key).update(msg).digest();
+  const offset = hmac[hmac.length - 1] & 0x0f;
+  const code =
+    ((hmac[offset] & 0x7f) << 24) |
+    ((hmac[offset + 1] & 0xff) << 16) |
+    ((hmac[offset + 2] & 0xff) << 8) |
+    (hmac[offset + 3] & 0xff);
+  return String(code % 1000000).padStart(6, "0");
+}
+function verifyTotpCode(secret: string, inputCode: string): { ok: boolean; step: number } {
+  const clean = String(inputCode || "").trim();
+  if (!/^\d{6}$/.test(clean) || !secret) return { ok: false, step: 0 };
+  const nowStep = Math.floor(Date.now() / 30000);
+  for (const delta of [-1, 0, 1]) {
+    if (constantTimeEqual(totpForStep(secret, nowStep + delta), clean)) {
+      return { ok: true, step: nowStep + delta };
+    }
+  }
+  return { ok: false, step: 0 };
+}
+
+async function getTokenVersion(userId: string): Promise<number> {
+  const key = `tv:${userId}`;
+  const cached = await redis.get(key);
+  if (cached !== null && Number.isFinite(Number(cached))) return Number(cached);
+  const [u] = await sql`select coalesce(token_version, 1)::integer as tv from public.users where id = ${userId} limit 1`;
+  const tv = Number(u?.tv || 1);
+  await redis.set(key, String(tv), "EX", 300);
+  return tv;
+}
+
+async function bumpTokenVersion(userId: string): Promise<number> {
+  const [u] = await sql`
+    update public.users
+    set token_version = coalesce(token_version, 1) + 1
+    where id = ${userId}
+    returning token_version
+  `;
+  const tv = Number(u?.token_version || 2);
+  await redis.set(`tv:${userId}`, String(tv), "EX", 300);
+  return tv;
+}
+
+async function issueJwt(user: { id: string; email: string; role: string }, dfp = "", tv = 1): Promise<string> {
+  return await new SignJWT({ email: user.email, role: user.role, dfp, tv })
     .setProtectedHeader({ alg: "HS256" })
     .setSubject(user.id)
     .setIssuedAt()
-    .setExpirationTime("30d")
+    .setExpirationTime("7d")
     .sign(enc.encode(JWT_SECRET));
 }
 
@@ -113,9 +239,18 @@ async function authenticateRequest(req: Request): Promise<{ id: string; email: s
   if (!token) return null;
   try {
     const { payload } = await jwtVerify(token, enc.encode(JWT_SECRET));
-    if (!payload.sub) return null;
+    if (!payload.sub || !payload.tv) return null;
+    const uid = String(payload.sub);
+    if (payload.dfp) {
+      const hdrFp = deviceFingerprint(req.headers.get("x-device-token") || "");
+      if (!hdrFp || !constantTimeEqual(String(payload.dfp), hdrFp)) {
+        return null;
+      }
+    }
+    const currentTv = await getTokenVersion(uid);
+    if (Number(payload.tv) !== currentTv) return null;
     return {
-      id: String(payload.sub),
+      id: uid,
       email: String(payload.email || ""),
       role: String(payload.role || "user"),
     };
@@ -397,10 +532,140 @@ async function ensurePerformanceIndexes() {
 }
 ensurePerformanceIndexes();
 
-async function issueCaptchaChallenge(userId: string) {
-  const code = randomCode(6);
+async function ensureMonetizationTables() {
+  try {
+    await sql`
+      create table if not exists public.monetization_settings (
+        id integer primary key default 1 check (id = 1),
+        ads_enabled boolean not null default false,
+        top_banner_img text default '',
+        top_banner_link text default '',
+        ad_script_url text default '',
+        ad_container_id text default '',
+        direct_link_url text default '',
+        direct_link_label text default '🎁 Sponsored Offer — Check Now',
+        offerwall_enabled boolean not null default false,
+        offerwall_name text default 'Offerwall Tasks',
+        offerwall_url text default '',
+        user_share_pct numeric(5, 2) not null default 60.00 check (user_share_pct between 1 and 95),
+        postback_secret text not null default '',
+        updated_at timestamptz not null default now()
+      )
+    `;
+    const randSecret = randomCode(24);
+    await sql`
+      insert into public.monetization_settings (id, postback_secret)
+      values (1, ${randSecret})
+      on conflict (id) do nothing
+    `;
+    await sql`
+      update public.monetization_settings
+      set postback_secret = ${randSecret}
+      where id = 1 and coalesce(postback_secret, '') = ''
+    `;
+    await sql`
+      create table if not exists public.offerwall_postbacks (
+        id bigserial primary key,
+        tx_id text unique not null,
+        user_id uuid not null references public.users(id) on delete cascade,
+        network text not null default 'offerwall',
+        gross_usdt numeric(14, 4) not null check (gross_usdt > 0),
+        user_share_usdt numeric(14, 4) not null check (user_share_usdt >= 0),
+        admin_profit_usdt numeric(14, 4) not null check (admin_profit_usdt >= 0),
+        created_at timestamptz not null default now()
+      )
+    `;
+    await sql`create index if not exists idx_offerwall_postbacks_user on public.offerwall_postbacks(user_id, created_at desc)`;
+  } catch (e) {
+    console.error("[ensureMonetizationTables]", e);
+  }
+}
+ensureMonetizationTables();
+
+async function ensureSecurityTables() {
+  try {
+    await sql`alter table public.users add column if not exists security_pin_hash text not null default ''`;
+    await sql`alter table public.users add column if not exists totp_secret text not null default ''`;
+    await sql`alter table public.users add column if not exists totp_enabled boolean not null default false`;
+    await sql`alter table public.users add column if not exists token_version integer not null default 1`;
+    await sql`
+      create table if not exists public.security_audit_logs (
+        id bigserial primary key,
+        user_id uuid references public.users(id) on delete set null,
+        email text not null default '',
+        event_type text not null,
+        ip_hash text not null default '',
+        ip_masked text not null default '',
+        device_fp text not null default '',
+        details text not null default '',
+        created_at timestamptz not null default now()
+      )
+    `;
+    await sql`create index if not exists idx_sec_audit_user_created on public.security_audit_logs(user_id, created_at desc)`;
+    await sql`create index if not exists idx_sec_audit_created on public.security_audit_logs(created_at desc)`;
+  } catch (e) {
+    console.error("[ensureSecurityTables]", e);
+  }
+}
+ensureSecurityTables();
+
+async function logSecurityEvent(
+  eventType: string,
+  ip: string,
+  opts: { userId?: string | null; email?: string; deviceFp?: string; details?: string } = {}
+) {
+  try {
+    const ipHash = sha256Hex("ip:" + ip + ":" + JWT_SECRET.slice(0, 8)).slice(0, 24);
+    const ipM = maskIp(ip);
+    await sql`
+      insert into public.security_audit_logs (user_id, email, event_type, ip_hash, ip_masked, device_fp, details)
+      values (
+        ${opts.userId || null},
+        ${String(opts.email || "").slice(0, 140)},
+        ${eventType.slice(0, 48)},
+        ${ipHash},
+        ${ipM},
+        ${String(opts.deviceFp || "").slice(0, 12)},
+        ${String(opts.details || "").slice(0, 200)}
+      )
+    `;
+  } catch {}
+}
+
+async function getCachedMonetizationPublic() {
+  return await getCachedConfigRow(
+    "cache:monetization_public",
+    () => sql`
+      select ads_enabled, top_banner_img, top_banner_link, ad_script_url, ad_container_id,
+             direct_link_url, direct_link_label, offerwall_enabled, offerwall_name,
+             offerwall_url, user_share_pct
+      from public.monetization_settings where id = 1
+    `,
+    { ads_enabled: false, offerwall_enabled: false, user_share_pct: 60 }
+  );
+}
+
+function isSafeHttpsUrl(v: unknown): string {
+  const s = String(v || "").trim();
+  if (!s) return "";
+  if (!/^https:\/\/[^\s"'<>]+$/i.test(s)) {
+    throw new Error("Only valid https:// URLs are allowed.");
+  }
+  return s.slice(0, 500);
+}
+
+function constantTimeEqual(a: string, b: string): boolean {
+  if (!a || !b || a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+async function issueCaptchaChallenge(userId: string, purpose = "earn") {
+  const code = randomCode(purpose === "auth" ? 5 : 6);
   const token = await signCaptchaToken({
     uid: userId,
+    purpose,
     code,
     nid: crypto.randomUUID(),
     exp: Date.now() + 180_000,
@@ -446,41 +711,66 @@ async function isUserAdmin(user: { id: string; email: string; role: string }): P
 }
 
 // ----------------------------------------------------------------------------
-// Auth Routes
+// Auth Routes (5-Layer Security Gate)
 // ----------------------------------------------------------------------------
+async function verifyAuthSecCaptcha(token: unknown, code: unknown): Promise<boolean> {
+  const v = await verifyCaptchaToken(String(token || ""));
+  if (!v || v.purpose !== "auth") return false;
+  if (String(code || "").trim().toUpperCase() !== String(v.code || "").toUpperCase()) return false;
+  const used = await redis.set(`auth_cap_used:${v.nid}`, "1", "EX", 240, "NX");
+  return Boolean(used);
+}
+
 async function handleAuth(pathname: string, req: Request): Promise<Response> {
   const ip = clientIp(req);
+  const hdrDfp = deviceFingerprint(req.headers.get("x-device-token") || "");
+
+  if (pathname === "/api/auth/login-challenge" && (req.method === "GET" || req.method === "POST")) {
+    if (!(await checkRateLimit(`rl:lchap:${sha256Hex(ip).slice(0, 16)}`, 40, 60))) {
+      return jsonRes({ error: "Too many challenge requests. Please wait." }, 429, req);
+    }
+    const ch = await issueCaptchaChallenge("auth-gate", "auth");
+    return jsonRes({ challenge_token: ch.challenge_id, svg: ch.svg }, 200, req);
+  }
+
   if (pathname === "/api/auth/signup" && req.method === "POST") {
     if (!(await checkRateLimit(`rl:signup:${ip}`, 15, 300))) {
-      return jsonRes({ error: "Too many signup attempts. Please wait a few minutes." }, 429);
+      return jsonRes({ error: "Too many signup attempts. Please wait a few minutes." }, 429, req);
     }
     const body: any = await req.json().catch(() => ({}));
     const email = String(body.email || "").trim().toLowerCase();
     const password = String(body.password || "");
-    if (!email || !email.includes("@")) return jsonRes({ error: "Invalid email or mobile ID." }, 400);
-    if (password.length < 8) return jsonRes({ error: "Password must be at least 8 characters." }, 400);
+    const pin = String(body.security_pin || "").trim();
+    const dfp = hdrDfp || deviceFingerprint(String(body.device_token || ""));
+
+    if (!email || !email.includes("@")) return jsonRes({ error: "Invalid email or mobile ID." }, 400, req);
+    if (password.length < 8 || password.length > 128) return jsonRes({ error: "Password must be 8 to 128 characters." }, 400, req);
+    if (!/^\d{4,6}$/.test(pin)) return jsonRes({ error: "Enter a 4 to 6 digit numeric Security PIN." }, 400, req);
+    if (!(await verifyAuthSecCaptcha(body.sec_captcha_token, body.sec_captcha_code))) {
+      return jsonRes({ error: "Server Security Code invalid or expired. Please refresh the code." }, 400, req);
+    }
     if (!(await verifyTurnstile(body.captchaToken))) {
-      return jsonRes({ error: "Human verification failed. Please retry captcha." }, 400);
+      return jsonRes({ error: "Cloudflare human verification failed. Please retry captcha." }, 400, req);
     }
 
     const appSet = await getCachedAppSettings();
     if (appSet && !appSet.registration_open) {
-      return jsonRes({ error: "Registrations are currently closed by admin." }, 403);
+      return jsonRes({ error: "Registrations are currently closed by admin." }, 403, req);
     }
     const cnt = await getFastRowCount("users", "cache:users_count", 20);
     if (appSet && cnt >= Number(appSet.max_registered)) {
-      return jsonRes({ error: "Registration limit reached." }, 403);
+      return jsonRes({ error: "Registration limit reached." }, 403, req);
     }
 
     const dup = await sql`select id from public.users where lower(email) = ${email} limit 1`;
-    if (dup.length) return jsonRes({ error: "Account already registered. Please log in." }, 400);
+    if (dup.length) return jsonRes({ error: "Account already registered. Please log in." }, 400, req);
 
-    const pwdHash = await hashPassword(password);
+    const [pwdHash, pinHash] = await Promise.all([hashPassword(password), hashPassword(pin)]);
     const isAdmin = ADMIN_EMAILS.has(email);
     const role = isAdmin ? "admin" : "user";
     const [u] = await sql`
-      insert into public.users (email, password_hash, role)
-      values (${email}, ${pwdHash}, ${role})
+      insert into public.users (email, password_hash, security_pin_hash, role, token_version)
+      values (${email}, ${pwdHash}, ${pinHash}, ${role}, 1)
       returning id, email, role, created_at
     `;
     await sql`
@@ -489,70 +779,188 @@ async function handleAuth(pathname: string, req: Request): Promise<Response> {
     `;
     safeIncrIfCached("cache:users_count");
     safeIncrIfCached("cache:reg_count");
+    logSecurityEvent("signup_success", ip, { userId: u.id, email: u.email, deviceFp: dfp, details: "5-layer account registered" });
 
-    const access_token = await issueJwt({ id: u.id, email: u.email, role: u.role });
-    return jsonRes({ user: u, session: { access_token, user: u } });
+    const access_token = await issueJwt({ id: u.id, email: u.email, role: u.role }, dfp, 1);
+    return jsonRes({ user: u, session: { access_token, user: u } }, 200, req);
   }
 
   if (pathname === "/api/auth/login" && req.method === "POST") {
     if (!(await checkRateLimit(`rl:login:${ip}`, 25, 300))) {
-      return jsonRes({ error: "Too many login attempts. Please wait 5 minutes." }, 429);
+      return jsonRes({ error: "Too many login attempts from your network. Please wait 5 minutes." }, 429, req);
     }
     const body: any = await req.json().catch(() => ({}));
     const email = String(body.email || "").trim().toLowerCase();
     const password = String(body.password || "");
-    if (!(await verifyTurnstile(body.captchaToken))) {
-      return jsonRes({ error: "Human verification failed. Please retry." }, 400);
+    const pin = String(body.security_pin || "").trim();
+    const totpCode = String(body.totp_code || "").trim();
+    const dfp = hdrDfp || deviceFingerprint(String(body.device_token || ""));
+
+    if (!email || !password) return jsonRes({ error: "Email/ID and password are required." }, 400, req);
+
+    // Per-account brute-force lockout (5 fails -> 15 min lock)
+    const failKey = `login_fail:${sha256Hex(email).slice(0, 24)}`;
+    const fails = Number((await redis.get(failKey)) || 0);
+    if (fails >= 5) {
+      logSecurityEvent("login_locked_attempt", ip, { email, deviceFp: dfp, details: "Account in 15m brute-force cooldown" });
+      return jsonRes({ error: "Account temporarily locked for 15 minutes due to 5 failed attempts." }, 429, req);
     }
+
+    // Shield 3: Server Cryptographic Captcha
+    if (!(await verifyAuthSecCaptcha(body.sec_captcha_token, body.sec_captcha_code))) {
+      return jsonRes({ error: "Server Security Code invalid or expired. Tap refresh & enter the code." }, 400, req);
+    }
+
+    // Shield 4: Cloudflare Turnstile
+    if (!(await verifyTurnstile(body.captchaToken))) {
+      return jsonRes({ error: "Cloudflare verification failed. Please retry." }, 400, req);
+    }
+
     const [u] = await sql`
-      select u.id, u.email, u.password_hash, u.role, p.account_status
+      select u.id, u.email, u.password_hash, u.security_pin_hash, u.totp_secret, u.totp_enabled,
+             coalesce(u.token_version, 1)::integer as token_version, u.role, p.account_status
       from public.users u
       left join public.profiles p on p.id = u.id
       where lower(u.email) = ${email} limit 1
     `;
+    const recordFail = async (ev: string, reason: string) => {
+      const n = await redis.incr(failKey);
+      if (n === 1) await redis.expire(failKey, 900);
+      if (n === 5) await redis.expire(failKey, 900);
+      logSecurityEvent(n >= 5 ? "login_locked" : ev, ip, { userId: u?.id, email, deviceFp: dfp, details: reason });
+    };
+
+    // Shield 1: Password check
     if (!u || !(await verifyPassword(password, u.password_hash))) {
-      return jsonRes({ error: "Invalid login credentials." }, 401);
+      await recordFail("login_failed_password", "Wrong password");
+      return jsonRes({ error: "Invalid login credentials." }, 401, req);
     }
     if (u.account_status === "blocked") {
-      return jsonRes({ error: "Account is blocked by admin." }, 403);
+      logSecurityEvent("login_blocked_user", ip, { userId: u.id, email, deviceFp: dfp, details: "Blocked user login attempt" });
+      return jsonRes({ error: "Account is blocked by admin." }, 403, req);
     }
-    const access_token = await issueJwt({ id: u.id, email: u.email, role: u.role });
+
+    // Shield 2: Personal Security PIN (or seamless first-time PIN setup if unset)
+    if (!u.security_pin_hash) {
+      const setupToken = await signCaptchaToken({
+        uid: u.id,
+        purpose: "pin_setup",
+        dfp,
+        nid: crypto.randomUUID(),
+        exp: Date.now() + 300_000,
+      });
+      return jsonRes({
+        requires_pin_setup: true,
+        setup_token: setupToken,
+        message: "Shield 2 setup: Create a 4 to 6 digit Security PIN to activate your 5-Layer Login Protection.",
+      }, 200, req);
+    }
+    if (!/^\d{4,6}$/.test(pin) || !(await verifyPassword(pin, u.security_pin_hash))) {
+      await recordFail("login_failed_pin", "Wrong 6-digit Security PIN");
+      return jsonRes({ error: "Invalid Security PIN (Shield 2).", code: "PIN_INVALID" }, 401, req);
+    }
+
+    // Optional Extra Shield: Authenticator TOTP 2FA (when enabled)
+    if (u.totp_enabled && u.totp_secret) {
+      const totpRes = verifyTotpCode(u.totp_secret, totpCode);
+      if (!totpRes.ok) {
+        await recordFail("login_failed_totp", "Invalid 2FA Authenticator code");
+        return jsonRes({ error: "Valid 6-digit Authenticator 2FA code required.", code: "TOTP_REQUIRED" }, 401, req);
+      }
+      const replayGuard = await redis.set(`totp_used:${u.id}:${totpRes.step}`, "1", "EX", 120, "NX");
+      if (!replayGuard) {
+        return jsonRes({ error: "Authenticator code already used. Wait 30s for next code." }, 401, req);
+      }
+    }
+
+    await redis.del(failKey);
+    await redis.set(`tv:${u.id}`, String(u.token_version), "EX", 300);
+    logSecurityEvent("login_success", ip, { userId: u.id, email: u.email, deviceFp: dfp, details: "5-layer login verified" });
+
+    // Shield 5: Device-bound JWT + Token Version
+    const access_token = await issueJwt({ id: u.id, email: u.email, role: u.role }, dfp, u.token_version);
     return jsonRes({
       user: { id: u.id, email: u.email, role: u.role, is_anonymous: false },
       session: { access_token, user: { id: u.id, email: u.email, role: u.role, is_anonymous: false } },
-    });
+    }, 200, req);
+  }
+
+  if (pathname === "/api/auth/setup-pin" && req.method === "POST") {
+    if (!(await checkRateLimit(`rl:pinsetup:${ip}`, 15, 300))) {
+      return jsonRes({ error: "Too many PIN setup attempts." }, 429, req);
+    }
+    const body: any = await req.json().catch(() => ({}));
+    const setupData = await verifyCaptchaToken(String(body.setup_token || ""));
+    if (!setupData || setupData.purpose !== "pin_setup" || !UUID_RE.test(String(setupData.uid || ""))) {
+      return jsonRes({ error: "PIN setup session expired. Please sign in again." }, 401, req);
+    }
+    const dfp = hdrDfp || deviceFingerprint(String(body.device_token || ""));
+    if (setupData.dfp && (!dfp || !constantTimeEqual(String(setupData.dfp), dfp))) {
+      return jsonRes({ error: "Device mismatch during PIN setup." }, 403, req);
+    }
+    const used = await redis.set(`pin_setup_used:${setupData.nid}`, "1", "EX", 360, "NX");
+    if (!used) return jsonRes({ error: "Setup token already used. Please log in." }, 400, req);
+
+    const pin = String(body.security_pin || "").trim();
+    if (!/^\d{4,6}$/.test(pin)) return jsonRes({ error: "Security PIN must be 4 to 6 digits." }, 400, req);
+
+    const [u] = await sql`
+      select id, email, role, security_pin_hash, coalesce(token_version, 1)::integer as token_version
+      from public.users where id = ${setupData.uid} limit 1
+    `;
+    if (!u) return jsonRes({ error: "Account not found." }, 404, req);
+    if (u.security_pin_hash) return jsonRes({ error: "Security PIN is already set. Log in normally." }, 400, req);
+
+    const pinHash = await hashPassword(pin);
+    await sql`update public.users set security_pin_hash = ${pinHash} where id = ${u.id}`;
+    await redis.set(`tv:${u.id}`, String(u.token_version), "EX", 300);
+    logSecurityEvent("pin_setup", ip, { userId: u.id, email: u.email, deviceFp: dfp, details: "Initial Security PIN activated" });
+
+    const access_token = await issueJwt({ id: u.id, email: u.email, role: u.role }, dfp, u.token_version);
+    return jsonRes({
+      user: { id: u.id, email: u.email, role: u.role, is_anonymous: false },
+      session: { access_token, user: { id: u.id, email: u.email, role: u.role, is_anonymous: false } },
+      message: "5-Layer Security PIN activated!",
+    }, 200, req);
   }
 
   if (pathname === "/api/auth/user" && req.method === "GET") {
     const user = await authenticateRequest(req);
-    if (!user) return jsonRes({ user: null }, 200);
-    return jsonRes({ user: { ...user, is_anonymous: false } });
+    if (!user) return jsonRes({ user: null }, 200, req);
+    return jsonRes({ user: { ...user, is_anonymous: false } }, 200, req);
   }
 
   if (pathname === "/api/auth/update-user" && req.method === "POST") {
     const user = await authenticateRequest(req);
-    if (!user) return jsonRes({ error: "Login required." }, 401);
+    if (!user) return jsonRes({ error: "Login required." }, 401, req);
     const body: any = await req.json().catch(() => ({}));
     if (body.password) {
-      if (String(body.password).length < 8) return jsonRes({ error: "Password must be at least 8 characters." }, 400);
+      if (String(body.password).length < 8) return jsonRes({ error: "Password must be at least 8 characters." }, 400, req);
       await sql`update public.users set password_hash = ${await hashPassword(String(body.password))} where id = ${user.id}`;
+      await bumpTokenVersion(user.id);
+      logSecurityEvent("password_changed", ip, { userId: user.id, email: user.email, deviceFp: hdrDfp, details: "User updated password" });
     }
     if (body.email) {
       const nextEmail = String(body.email).trim().toLowerCase();
       await sql`update public.users set email = ${nextEmail} where id = ${user.id}`;
       await sql`update public.profiles set email = ${nextEmail} where id = ${user.id}`;
     }
-    return jsonRes({ user });
+    return jsonRes({ user }, 200, req);
   }
 
-  return jsonRes({ error: "Unknown auth endpoint" }, 404);
+  return jsonRes({ error: "Unknown auth endpoint" }, 404, req);
 }
 
 // ----------------------------------------------------------------------------
-// Main Router (with Automatic Gzip Compression to Cut Egress Bandwidth ~70%)
+// Main Router (with Automatic Gzip Compression & Security Headers)
 // ----------------------------------------------------------------------------
 async function routeRequest(req: Request): Promise<Response> {
-    if (req.method === "OPTIONS") return new Response("ok", { status: 200, headers: CORS_HEADERS });
+    if (req.method === "OPTIONS") return new Response("ok", { status: 200, headers: buildCorsHeaders(req) });
+
+    const contentLength = Number(req.headers.get("content-length") || 0);
+    if (contentLength > 600_000) {
+      return jsonRes({ error: "Payload too large." }, 413, req);
+    }
 
     const url = new URL(req.url);
     const path = url.pathname;
@@ -560,18 +968,18 @@ async function routeRequest(req: Request): Promise<Response> {
     if (path === "/health" || path === "/") {
       try {
         await Promise.all([sql`select 1`, redis.ping()]);
-        return jsonRes({ ok: true, status: "healthy", mode: "hetzner-standalone" });
+        return jsonRes({ ok: true, status: "healthy", mode: "hetzner-standalone" }, 200, req);
       } catch (e: any) {
-        return jsonRes({ ok: false, error: e?.message || "unhealthy" }, 503);
+        return jsonRes({ ok: false, error: e?.message || "unhealthy" }, 503, req);
       }
     }
 
     if (path === "/captcha.svg") {
       const verified = await verifyCaptchaToken(url.searchParams.get("n") || "");
-      if (!verified?.code) return new Response("Expired", { status: 400 });
+      if (!verified?.code) return new Response("Expired", { status: 400, headers: buildCorsHeaders(req) });
       return new Response(renderCaptchaSvg(String(verified.code)), {
         status: 200,
-        headers: { ...CORS_HEADERS, "Content-Type": "image/svg+xml", "Cache-Control": "no-store" },
+        headers: { ...buildCorsHeaders(req), "Content-Type": "image/svg+xml", "Cache-Control": "no-store" },
       });
     }
 
@@ -585,6 +993,64 @@ async function routeRequest(req: Request): Promise<Response> {
       return jsonRes({ data: cnt });
     }
 
+    if (path === "/api/postback/offerwall") {
+      try {
+        const bodyData: Record<string, any> = req.method === "POST"
+          ? await req.json().catch(async () => Object.fromEntries(new URLSearchParams(await req.text().catch(() => ""))))
+          : {};
+        const q = url.searchParams;
+        const param = (keys: string[]) => {
+          for (const k of keys) {
+            const v = q.get(k) ?? bodyData[k];
+            if (v !== undefined && v !== null && String(v).trim() !== "") return String(v).trim();
+          }
+          return "";
+        };
+        const secret = param(["secret", "key", "sig"]);
+        const userId = param(["user_id", "uid", "subid", "subid1"]);
+        const txId = param(["tx_id", "trans_id", "transaction_id", "tid"]).slice(0, 120);
+        const payoutRaw = Number(param(["payout", "amount", "usd", "currency_amount"]));
+        const network = param(["network", "wall"]) || "offerwall";
+
+        const [cfg] = await sql`select postback_secret, user_share_pct, offerwall_enabled from public.monetization_settings where id = 1`;
+        if (!cfg || !constantTimeEqual(secret, String(cfg.postback_secret || ""))) {
+          return jsonRes({ error: "Invalid postback secret." }, 403);
+        }
+        if (!UUID_RE.test(userId)) return jsonRes({ error: "Invalid user_id." }, 400);
+        if (!txId) return jsonRes({ error: "tx_id is required." }, 400);
+        if (!Number.isFinite(payoutRaw) || payoutRaw <= 0 || payoutRaw > 5000) {
+          return jsonRes({ error: "Invalid payout amount." }, 400);
+        }
+
+        const sharePct = Math.min(95, Math.max(1, Number(cfg.user_share_pct || 60)));
+        const grossUsdt = Math.round(payoutRaw * 10000) / 10000;
+        const userShareUsdt = Math.round(grossUsdt * (sharePct / 100) * 10000) / 10000;
+        const adminProfitUsdt = Math.round((grossUsdt - userShareUsdt) * 10000) / 10000;
+
+        const credited = await sql.begin(async (tx: any) => {
+          const [u] = await tx`select id from public.users where id = ${userId} limit 1`;
+          if (!u) throw new Error("User not found.");
+          const ins = await tx`
+            insert into public.offerwall_postbacks (tx_id, user_id, network, gross_usdt, user_share_usdt, admin_profit_usdt)
+            values (${txId}, ${userId}, ${network.slice(0, 40)}, ${grossUsdt}, ${userShareUsdt}, ${adminProfitUsdt})
+            on conflict (tx_id) do nothing
+            returning id
+          `;
+          if (!ins.length) return false;
+          if (userShareUsdt > 0) {
+            await tx`
+              insert into public.wallet_ledger (user_id, entry_type, amount, description)
+              values (${userId}, 'offerwall_income', ${userShareUsdt}, ${`${network} task reward (${sharePct}% share)`})
+            `;
+          }
+          return true;
+        });
+        return jsonRes({ ok: true, status: credited ? "credited" : "duplicate", tx_id: txId, user_share_usdt: userShareUsdt, admin_profit_usdt: adminProfitUsdt });
+      } catch (e: any) {
+        return jsonRes({ error: e?.message || "Postback error" }, 400);
+      }
+    }
+
     // Public & Authenticated Table Reads
     if (path.startsWith("/api/table/")) {
       const table = path.replace("/api/table/", "");
@@ -594,23 +1060,30 @@ async function routeRequest(req: Request): Promise<Response> {
       if (table === "compounding_settings") {
         return jsonRes({ data: await getCachedCompoundingSettings() });
       }
+      if (table === "monetization_settings") {
+        return jsonRes({ data: await getCachedMonetizationPublic() });
+      }
       if (table === "profiles") {
         const user = await authenticateRequest(req);
-        if (!user) return jsonRes({ error: "Unauthorized" }, 401);
-        const [row] = await sql`select * from public.profiles where id = ${user.id} limit 1`;
-        return jsonRes({ data: row || null });
+        if (!user) return jsonRes({ error: "Unauthorized" }, 401, req);
+        const [row] = await sql`
+          select id, email, full_name, phone, gender, date_of_birth, city, state, pin_code,
+                 referral_code, referred_by, account_status, balance_usdt, device_locked, is_admin, created_at
+          from public.profiles where id = ${user.id} limit 1
+        `;
+        return jsonRes({ data: row || null }, 200, req);
       }
-      return jsonRes({ error: "Forbidden table" }, 403);
+      return jsonRes({ error: "Forbidden table" }, 403, req);
     }
 
     const user = await authenticateRequest(req);
-    if (!user) return jsonRes({ error: "Login required." }, 401);
+    if (!user) return jsonRes({ error: "Login required or device session expired." }, 401, req);
 
     if (path === "/api/rpc/my_team_list") {
       const body: any = await req.json().catch(() => ({}));
       const maxLevel = Math.max(1, Math.min(8, Number(body.max_level || 8)));
       const rows = await sql`select * from public.my_team_list(${user.id}::uuid, ${maxLevel})`;
-      return jsonRes({ data: rows });
+      return jsonRes({ data: rows }, 200, req);
     }
 
     const body: Record<string, any> = await req.json().catch(() => ({}));
@@ -620,22 +1093,22 @@ async function routeRequest(req: Request): Promise<Response> {
       const deviceToken = String(body.device_token || "").trim();
       const [appSet, [prof]] = await Promise.all([
         getCachedAppSettings(),
-        sql`select * from public.profiles where id = ${user.id} limit 1`,
+        sql`select id, full_name, referred_by, account_status, device_locked, device_token from public.profiles where id = ${user.id} limit 1`,
       ]);
-      if (!prof) return jsonRes({ error: "Profile not found." }, 404);
+      if (!prof) return jsonRes({ error: "Profile not found." }, 404, req);
       if (prof.account_status === "blocked") {
-        return jsonRes({ error: "Account blocked by admin.", code: "DEVICE_LOCKED" }, 403);
+        return jsonRes({ error: "Account blocked by admin.", code: "DEVICE_LOCKED" }, 403, req);
       }
 
       if (appSet?.device_lock_enabled && prof.device_locked && deviceToken) {
         if (prof.device_token && prof.device_token !== deviceToken) {
-          return jsonRes({ error: "This account is locked to another device.", code: "DEVICE_LOCKED" }, 403);
+          return jsonRes({ error: "This account is locked to another device.", code: "DEVICE_LOCKED" }, 403, req);
         }
         const other = await sql`
           select id from public.profiles where device_token = ${deviceToken} and id <> ${user.id} limit 1
         `;
         if (other.length) {
-          return jsonRes({ error: "This device is already linked to another account.", code: "DEVICE_TAKEN" }, 403);
+          return jsonRes({ error: "This device is already linked to another account.", code: "DEVICE_TAKEN" }, 403, req);
         }
       }
 
@@ -655,29 +1128,30 @@ async function routeRequest(req: Request): Promise<Response> {
               device_token = coalesce(device_token, ${deviceToken || null})
           where id = ${user.id}
         `;
-        return jsonRes({ ok: true, needs_details: false });
+        return jsonRes({ ok: true, needs_details: false }, 200, req);
       }
 
       if (!prof.device_token && deviceToken) {
         await sql`update public.profiles set device_token = ${deviceToken} where id = ${user.id}`;
       }
-      return jsonRes({ ok: true, needs_details: !prof.full_name });
+      return jsonRes({ ok: true, needs_details: !prof.full_name }, 200, req);
     }
 
     // user-finance
     if (path === "/api/functions/user-finance") {
-      return await handleUserFinance(String(body.action || ""), body, user);
+      return await handleUserFinance(String(body.action || ""), body, user, req);
     }
 
     // admin-control
     if (path === "/api/functions/admin-control") {
       if (!(await isUserAdmin(user))) {
-        return jsonRes({ error: "Forbidden: Admin privileges required." }, 403);
+        logSecurityEvent("unauthorized_admin_attempt", clientIp(req), { userId: user.id, email: user.email, details: `Action: ${String(body.action || "")}` });
+        return jsonRes({ error: "Forbidden: Admin privileges required." }, 403, req);
       }
-      return await handleAdminControl(String(body.action || ""), body, user);
+      return await handleAdminControl(String(body.action || ""), body, user, req);
     }
 
-    return jsonRes({ error: "Unknown endpoint" }, 404);
+    return jsonRes({ error: "Unknown endpoint" }, 404, req);
 }
 
 const server = Bun.serve({
@@ -710,7 +1184,7 @@ const server = Bun.serve({
 // ----------------------------------------------------------------------------
 // User Finance Handlers
 // ----------------------------------------------------------------------------
-async function handleUserFinance(action: string, body: Record<string, any>, user: { id: string }): Promise<Response> {
+async function handleUserFinance(action: string, body: Record<string, any>, user: { id: string; email?: string; role?: string }, req?: Request): Promise<Response> {
   try {
     if (action === "captcha_new") {
       return jsonRes(await issueCaptchaChallenge(user.id));
@@ -783,7 +1257,7 @@ async function handleUserFinance(action: string, body: Record<string, any>, user
       else if (group === "withdrawal") types = ["withdrawal_reserve", "withdrawal_refund"];
       else if (group === "adjust") types = ["admin_adjustment"];
       else if (group === "income") {
-        types = ["captcha_income", "signup_bonus", "fast_start_bonus", "streak_bonus", "level_once", "level_daily", "compounding_daily", "compounding_maturity"];
+        types = ["captcha_income", "signup_bonus", "fast_start_bonus", "streak_bonus", "level_once", "level_daily", "compounding_daily", "compounding_maturity", "offerwall_income"];
       }
 
       const rows = await sql`
@@ -958,6 +1432,51 @@ async function handleUserFinance(action: string, body: Record<string, any>, user
       return jsonRes({ message: "Reply sent." });
     }
 
+    if (action === "offerwall_info") {
+      const [cfg, logs] = await Promise.all([
+        getCachedMonetizationPublic(),
+        sql`select tx_id, network, user_share_usdt, created_at from public.offerwall_postbacks where user_id = ${user.id} order by id desc limit 20`,
+      ]);
+      return jsonRes({ config: cfg, user_id: user.id, recent_credits: logs });
+    }
+
+    if (action === "security_status") {
+      const [[u], logs] = await Promise.all([
+        sql`select security_pin_hash <> '' as pin_set, totp_enabled, coalesce(token_version, 1) as token_version from public.users where id = ${user.id} limit 1`,
+        sql`select event_type, ip_masked, device_fp, details, created_at from public.security_audit_logs where user_id = ${user.id} order by id desc limit 10`,
+      ]);
+      return jsonRes({
+        pin_set: Boolean(u?.pin_set),
+        totp_enabled: Boolean(u?.totp_enabled),
+        token_version: Number(u?.token_version || 1),
+        recent_logs: logs,
+      });
+    }
+
+    if (action === "change_security_pin") {
+      const curPwd = String(body.current_password || "");
+      const newPin = String(body.new_pin || "").trim();
+      if (!curPwd) return jsonRes({ error: "Enter your current password." }, 400);
+      if (!/^\d{4,6}$/.test(newPin)) return jsonRes({ error: "Security PIN must be 4 to 6 digits." }, 400);
+      const [u] = await sql`select id, email, role, password_hash from public.users where id = ${user.id} limit 1`;
+      if (!u || !(await verifyPassword(curPwd, u.password_hash))) {
+        return jsonRes({ error: "Current password is incorrect." }, 401);
+      }
+      const pinHash = await hashPassword(newPin);
+      await sql`update public.users set security_pin_hash = ${pinHash} where id = ${user.id}`;
+      const tv = await bumpTokenVersion(user.id);
+      const dfp = deviceFingerprint(req?.headers.get("x-device-token") || "");
+      const access_token = await issueJwt({ id: u.id, email: u.email, role: u.role }, dfp, tv);
+      if (req) logSecurityEvent("pin_changed", clientIp(req), { userId: u.id, email: u.email, deviceFp: dfp, details: "User updated 5-layer PIN" });
+      return jsonRes({ message: "Security PIN updated & all other sessions signed out.", access_token });
+    }
+
+    if (action === "logout_all_devices") {
+      await bumpTokenVersion(user.id);
+      if (req) logSecurityEvent("logout_all", clientIp(req), { userId: user.id, email: user.email || "", details: "User revoked all active device sessions" });
+      return jsonRes({ message: "All devices logged out. Please sign in again." });
+    }
+
     return jsonRes({ error: `Unknown user action: ${action}` }, 400);
   } catch (err: any) {
     return jsonRes({ error: err?.message || "Server error" }, 400);
@@ -970,7 +1489,8 @@ async function handleUserFinance(action: string, body: Record<string, any>, user
 async function handleAdminControl(
   action: string,
   body: Record<string, any>,
-  adminUser: { id: string; email: string; role: string }
+  adminUser: { id: string; email: string; role: string },
+  req?: Request
 ): Promise<Response> {
   try {
     if (action === "get_settings") {
@@ -991,13 +1511,17 @@ async function handleAdminControl(
       const lim = Math.min(200, Math.max(10, Number(body.limit) || 50));
       const users = q
         ? await sql`
-            select id, email, full_name, phone, account_status, balance_usdt as wallet_balance, created_at
+            select id, email, full_name,
+                   case when length(coalesce(phone, '')) >= 4 then 'XXXXXX' || right(phone, 4) else '-' end as phone,
+                   account_status, balance_usdt as wallet_balance, created_at
             from public.profiles
             where email ilike ${"%" + q + "%"} or full_name ilike ${"%" + q + "%"} or phone ilike ${"%" + q + "%"}
             order by created_at desc limit ${lim}
           `
         : await sql`
-            select id, email, full_name, phone, account_status, balance_usdt as wallet_balance, created_at
+            select id, email, full_name,
+                   case when length(coalesce(phone, '')) >= 4 then 'XXXXXX' || right(phone, 4) else '-' end as phone,
+                   account_status, balance_usdt as wallet_balance, created_at
             from public.profiles order by created_at desc limit ${lim}
           `;
       return jsonRes({ users });
@@ -1006,14 +1530,21 @@ async function handleAdminControl(
     if (action === "user_detail") {
       const uid = String(body.user_id || "");
       const [[profile], ledger] = await Promise.all([
-        sql`select * from public.profiles where id = ${uid} limit 1`,
+        sql`
+          select id, email, full_name, phone, gender, date_of_birth, city, state, pin_code,
+                 referral_code, referred_by, account_status, device_locked, is_admin, balance_usdt, created_at
+          from public.profiles where id = ${uid} limit 1
+        `,
         sql`select * from public.wallet_ledger where user_id = ${uid} order by created_at desc limit 50`,
       ]);
       return jsonRes({ profile, wallet_balance: Number(profile?.balance_usdt || 0), ledger });
     }
 
     if (action === "set_user_status") {
-      await sql`update public.profiles set account_status = ${String(body.status)} where id = ${String(body.user_id)}`;
+      const st = String(body.status || "");
+      if (!["active", "review", "blocked", "pending"].includes(st)) return jsonRes({ error: "Invalid account status." }, 400);
+      await sql`update public.profiles set account_status = ${st} where id = ${String(body.user_id)}`;
+      if (st === "blocked") await bumpTokenVersion(String(body.user_id));
       return jsonRes({ message: "User status updated." });
     }
     if (action === "reset_device_lock") {
@@ -1024,6 +1555,7 @@ async function handleAdminControl(
       const pwd = String(body.password || "");
       if (pwd.length < 8 || pwd.length > 128) return jsonRes({ error: "Password must be 8 to 128 characters." }, 400);
       await sql`update public.users set password_hash = ${await hashPassword(pwd)} where id = ${String(body.user_id)}`;
+      await bumpTokenVersion(String(body.user_id));
       return jsonRes({ message: "User password reset." });
     }
     if (action === "change_admin_password") {
@@ -1036,7 +1568,10 @@ async function handleAdminControl(
         return jsonRes({ error: "Current password is incorrect." }, 400);
       }
       await sql`update public.users set password_hash = ${await hashPassword(newPwd)} where id = ${adminUser.id}`;
-      return jsonRes({ message: "Your Admin Panel password has been updated. Use the new password on next login." });
+      const tv = await bumpTokenVersion(adminUser.id);
+      const dfp = deviceFingerprint(req?.headers.get("x-device-token") || "");
+      const access_token = await issueJwt({ id: adminUser.id, email: adminUser.email, role: adminUser.role }, dfp, tv);
+      return jsonRes({ message: "Your Admin Panel password has been updated & other sessions logged out.", access_token });
     }
     if (action === "list_admins") {
       const envList = Array.from(ADMIN_EMAILS);
@@ -1147,6 +1682,7 @@ async function handleAdminControl(
         return jsonRes({ error: "Selected user does not have admin access." }, 400);
       }
       await sql`update public.users set password_hash = ${await hashPassword(newPwd)} where id = ${target.id}`;
+      await bumpTokenVersion(target.id);
       return jsonRes({ message: `Admin password updated for ${target.email}.` });
     }
     if (action === "revoke_admin") {
@@ -1164,6 +1700,7 @@ async function handleAdminControl(
       }
       await sql`update public.users set role = 'user' where id = ${target.id}`;
       await sql`update public.profiles set is_admin = false where id = ${target.id}`;
+      await bumpTokenVersion(target.id);
       return jsonRes({ message: `Admin access removed from ${target.email}.` });
     }
     if (action === "update_user_profile") {
@@ -1176,6 +1713,7 @@ async function handleAdminControl(
     if (action === "adjust_wallet") {
       const uid = String(body.user_id);
       const amt = Number(body.amount);
+      if (!Number.isFinite(amt) || amt === 0) return jsonRes({ error: "Invalid adjustment amount." }, 400);
       await sql`
         insert into public.wallet_ledger (user_id, entry_type, amount, description)
         values (${uid}, 'admin_adjustment', ${amt}, ${String(body.reason || "Admin adjustment")})
@@ -1196,17 +1734,26 @@ async function handleAdminControl(
     }
     if (action === "settle_withdrawal") {
       const wid = Number(body.withdrawal_id);
-      const dec = String(body.decision);
+      const dec = String(body.decision || "");
       const note = String(body.note || "");
-      const [w] = await sql`select * from public.withdrawal_requests where id = ${wid} limit 1`;
-      if (!w || w.status !== "pending") return jsonRes({ error: "Pending withdrawal not found." }, 404);
-      await sql`update public.withdrawal_requests set status = ${dec}, admin_note = ${note}, settled_at = now() where id = ${wid}`;
-      if (dec === "rejected") {
-        await sql`
-          insert into public.wallet_ledger (user_id, entry_type, amount, description)
-          values (${w.user_id}, 'withdrawal_refund', ${w.amount}, ${`Withdrawal #${wid} rejected: ${note}`})
+      if (!["approved", "rejected"].includes(dec)) return jsonRes({ error: "Invalid decision." }, 400);
+      const settled = await sql.begin(async (tx: any) => {
+        const [w] = await tx`
+          update public.withdrawal_requests
+          set status = ${dec}, admin_note = ${note}, settled_at = now()
+          where id = ${wid} and status = 'pending'
+          returning *
         `;
-      }
+        if (!w) return null;
+        if (dec === "rejected") {
+          await tx`
+            insert into public.wallet_ledger (user_id, entry_type, amount, description)
+            values (${w.user_id}, 'withdrawal_refund', ${w.amount}, ${`Withdrawal #${wid} rejected: ${note}`})
+          `;
+        }
+        return w;
+      });
+      if (!settled) return jsonRes({ error: "Pending withdrawal not found." }, 404);
       return jsonRes({ message: `Withdrawal #${wid} ${dec}.` });
     }
 
@@ -1219,16 +1766,25 @@ async function handleAdminControl(
     }
     if (action === "settle_deposit") {
       const did = Number(body.deposit_id);
-      const dec = String(body.decision);
-      const [d] = await sql`select * from public.deposits where id = ${did} limit 1`;
-      if (!d || d.status !== "pending") return jsonRes({ error: "Pending deposit not found." }, 404);
-      await sql`update public.deposits set status = ${dec}, admin_note = ${String(body.note || "")}, settled_at = now() where id = ${did}`;
-      if (dec === "approved") {
-        await sql`
-          insert into public.wallet_ledger (user_id, entry_type, amount, description)
-          values (${d.user_id}, 'deposit_credit', ${d.amount_usdt}, ${`Deposit #${did} approved (${d.tx_id})`})
+      const dec = String(body.decision || "");
+      if (!["approved", "rejected"].includes(dec)) return jsonRes({ error: "Invalid decision." }, 400);
+      const settled = await sql.begin(async (tx: any) => {
+        const [d] = await tx`
+          update public.deposits
+          set status = ${dec}, admin_note = ${String(body.note || "")}, settled_at = now()
+          where id = ${did} and status = 'pending'
+          returning *
         `;
-      }
+        if (!d) return null;
+        if (dec === "approved") {
+          await tx`
+            insert into public.wallet_ledger (user_id, entry_type, amount, description)
+            values (${d.user_id}, 'deposit_credit', ${d.amount_usdt}, ${`Deposit #${did} approved (${d.tx_id})`})
+          `;
+        }
+        return d;
+      });
+      if (!settled) return jsonRes({ error: "Pending deposit not found." }, 404);
       return jsonRes({ message: `Deposit #${did} ${dec}.` });
     }
 
@@ -1480,7 +2036,7 @@ async function handleAdminControl(
       if (!plan) return jsonRes({ error: "Plan not found." }, 404);
       if (op === "pause") await sql`update public.compounding_plans set status = 'paused' where id = ${pid}`;
       else if (op === "resume") await sql`update public.compounding_plans set status = 'active' where id = ${pid}`;
-      else if (op === "complete") {
+      else if (op === "complete" || op === "complete_now") {
         const payInr = plan.credit_mode === "daily_to_main_wallet" ? Number(plan.principal_inr) : Number(plan.current_balance_inr);
         await sql`update public.compounding_plans set status = 'completed', matured_at = now() where id = ${pid}`;
         await sql`insert into public.wallet_ledger (user_id, entry_type, amount, description) values (${plan.user_id}, 'compounding_maturity', ${payInr / USDT_INR_RATE}, ${`Admin matured Plan #${pid} (₹${payInr})`})`;
@@ -1505,6 +2061,143 @@ async function handleAdminControl(
         more = Boolean(r?.res?.has_more);
       }
       return jsonRes({ ok: true, processed_plans: processed, completed_plans: completed, total_profit_inr: profit, message: `Credited ${processed} plans (₹${profit.toFixed(2)}).` });
+    }
+
+    if (action === "get_monetization") {
+      const [[cfg], [stats], recent] = await Promise.all([
+        sql`select * from public.monetization_settings where id = 1`,
+        sql`
+          select count(*)::integer as total_tx,
+                 coalesce(sum(gross_usdt), 0) as total_gross_usdt,
+                 coalesce(sum(admin_profit_usdt), 0) as total_admin_profit_usdt,
+                 coalesce(sum(user_share_usdt), 0) as total_user_paid_usdt
+          from public.offerwall_postbacks
+        `,
+        sql`
+          select p.id, p.tx_id, p.user_id, p.network, p.gross_usdt, p.user_share_usdt, p.admin_profit_usdt, p.created_at,
+                 coalesce(pr.email, '') as email
+          from public.offerwall_postbacks p
+          left join public.profiles pr on pr.id = p.user_id
+          order by p.id desc limit 25
+        `,
+      ]);
+      return jsonRes({ settings: cfg, stats, recent });
+    }
+    if (action === "set_monetization") {
+      const topBannerImg = isSafeHttpsUrl(body.top_banner_img);
+      const topBannerLink = isSafeHttpsUrl(body.top_banner_link);
+      const adScriptUrl = isSafeHttpsUrl(body.ad_script_url);
+      const adContainerId = String(body.ad_container_id || "").trim().replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 80);
+      const directLinkUrl = isSafeHttpsUrl(body.direct_link_url);
+      const directLinkLabel = String(body.direct_link_label || "🎁 Sponsored Offer — Check Now").trim().slice(0, 80);
+      const offerwallName = String(body.offerwall_name || "Offerwall Tasks").trim().slice(0, 60);
+      const offerwallUrl = isSafeHttpsUrl(body.offerwall_url);
+      const sharePct = Number(body.user_share_pct ?? 60);
+      if (!Number.isFinite(sharePct) || sharePct < 1 || sharePct > 95) {
+        return jsonRes({ error: "User share must be between 1% and 95%." }, 400);
+      }
+      await sql`
+        update public.monetization_settings set
+          ads_enabled = ${Boolean(body.ads_enabled)},
+          top_banner_img = ${topBannerImg},
+          top_banner_link = ${topBannerLink},
+          ad_script_url = ${adScriptUrl},
+          ad_container_id = ${adContainerId},
+          direct_link_url = ${directLinkUrl},
+          direct_link_label = ${directLinkLabel},
+          offerwall_enabled = ${Boolean(body.offerwall_enabled)},
+          offerwall_name = ${offerwallName},
+          offerwall_url = ${offerwallUrl},
+          user_share_pct = ${sharePct},
+          updated_at = now()
+        where id = 1
+      `;
+      await redis.del("cache:monetization_public");
+      return jsonRes({ message: "Ads & Offerwall settings saved." });
+    }
+    if (action === "rotate_postback_secret") {
+      const nextSecret = randomCode(24);
+      await sql`update public.monetization_settings set postback_secret = ${nextSecret}, updated_at = now() where id = 1`;
+      return jsonRes({ postback_secret: nextSecret, message: "New Postback Secret generated. Update your Offerwall network URL!" });
+    }
+
+    // ---- 5-Layer Security Center & Audit Logs ----
+    if (action === "get_security_center") {
+      const [[me], [stats], logs] = await Promise.all([
+        sql`select security_pin_hash <> '' as pin_set, totp_enabled, coalesce(token_version, 1) as token_version from public.users where id = ${adminUser.id} limit 1`,
+        sql`
+          select count(*) filter (where event_type like 'login_failed%' and created_at > now() - interval '24 hours')::integer as fails_24h,
+                 count(*) filter (where event_type = 'login_locked' and created_at > now() - interval '24 hours')::integer as locks_24h,
+                 count(*) filter (where event_type = 'login_success' and created_at > now() - interval '24 hours')::integer as logins_24h
+          from public.security_audit_logs
+        `,
+        sql`select id, email, event_type, ip_masked, device_fp, details, created_at from public.security_audit_logs order by id desc limit 40`,
+      ]);
+      return jsonRes({
+        my_security: { pin_set: Boolean(me?.pin_set), totp_enabled: Boolean(me?.totp_enabled), token_version: Number(me?.token_version || 1) },
+        stats: stats || { fails_24h: 0, locks_24h: 0, logins_24h: 0 },
+        logs,
+      });
+    }
+    if (action === "set_admin_security_pin") {
+      const curPwd = String(body.current_password || "");
+      const newPin = String(body.new_pin || "").trim();
+      if (!curPwd) return jsonRes({ error: "Enter your current password." }, 400);
+      if (!/^\d{4,6}$/.test(newPin)) return jsonRes({ error: "Admin Security PIN must be 4 to 6 digits." }, 400);
+      const [me] = await sql`select id, password_hash from public.users where id = ${adminUser.id} limit 1`;
+      if (!me || !(await verifyPassword(curPwd, me.password_hash))) {
+        return jsonRes({ error: "Current password is incorrect." }, 401);
+      }
+      await sql`update public.users set security_pin_hash = ${await hashPassword(newPin)} where id = ${adminUser.id}`;
+      const tv = await bumpTokenVersion(adminUser.id);
+      const dfp = deviceFingerprint(req?.headers.get("x-device-token") || "");
+      const access_token = await issueJwt({ id: adminUser.id, email: adminUser.email, role: adminUser.role }, dfp, tv);
+      if (req) logSecurityEvent("admin_pin_changed", clientIp(req), { userId: adminUser.id, email: adminUser.email, deviceFp: dfp, details: "Admin updated 6-digit Security PIN" });
+      return jsonRes({ message: "Admin 6-digit Security PIN updated & old sessions revoked.", access_token });
+    }
+    if (action === "setup_admin_totp") {
+      const secret = generateBase32Secret(20);
+      await sql`update public.users set totp_secret = ${secret}, totp_enabled = false where id = ${adminUser.id}`;
+      const label = encodeURIComponent(`SmartCaptcha:${adminUser.email}`);
+      const otpauth_uri = `otpauth://totp/${label}?secret=${secret}&issuer=SmartCaptcha&digits=6&period=30`;
+      return jsonRes({ secret, otpauth_uri, message: "Scan/enter this secret in Google Authenticator, then enter the 6-digit code to activate." });
+    }
+    if (action === "enable_admin_totp") {
+      const curPwd = String(body.current_password || "");
+      const otp = String(body.totp_code || "").trim();
+      const [me] = await sql`select id, password_hash, totp_secret from public.users where id = ${adminUser.id} limit 1`;
+      if (!me || !(await verifyPassword(curPwd, me.password_hash))) return jsonRes({ error: "Current password is incorrect." }, 401);
+      if (!me.totp_secret) return jsonRes({ error: "Click Generate Authenticator Key first." }, 400);
+      if (!verifyTotpCode(me.totp_secret, otp).ok) return jsonRes({ error: "Invalid 6-digit Authenticator code." }, 400);
+      await sql`update public.users set totp_enabled = true where id = ${adminUser.id}`;
+      const tv = await bumpTokenVersion(adminUser.id);
+      const dfp = deviceFingerprint(req?.headers.get("x-device-token") || "");
+      const access_token = await issueJwt({ id: adminUser.id, email: adminUser.email, role: adminUser.role }, dfp, tv);
+      if (req) logSecurityEvent("totp_enabled", clientIp(req), { userId: adminUser.id, email: adminUser.email, deviceFp: dfp, details: "Admin enabled Google Authenticator 2FA" });
+      return jsonRes({ message: "Google Authenticator 2FA is now ACTIVE on your Admin login!", access_token });
+    }
+    if (action === "disable_admin_totp") {
+      const curPwd = String(body.current_password || "");
+      const otp = String(body.totp_code || "").trim();
+      const [me] = await sql`select id, password_hash, totp_secret from public.users where id = ${adminUser.id} limit 1`;
+      if (!me || !(await verifyPassword(curPwd, me.password_hash))) return jsonRes({ error: "Current password is incorrect." }, 401);
+      if (me.totp_secret && !verifyTotpCode(me.totp_secret, otp).ok) return jsonRes({ error: "Enter valid current 6-digit Authenticator code to disable 2FA." }, 400);
+      await sql`update public.users set totp_enabled = false, totp_secret = '' where id = ${adminUser.id}`;
+      if (req) logSecurityEvent("totp_disabled", clientIp(req), { userId: adminUser.id, email: adminUser.email, details: "Admin disabled TOTP 2FA" });
+      return jsonRes({ message: "Authenticator 2FA disabled." });
+    }
+    if (action === "unlock_login_email") {
+      const targetEmail = String(body.email || "").trim().toLowerCase();
+      if (!targetEmail) return jsonRes({ error: "Enter email or mobile login ID to unlock." }, 400);
+      const failKey = `login_fail:${sha256Hex(targetEmail).slice(0, 24)}`;
+      await redis.del(failKey);
+      return jsonRes({ message: `Login cooldown cleared for ${targetEmail}.` });
+    }
+    if (action === "logout_all_sessions") {
+      const targetId = UUID_RE.test(String(body.user_id || "")) ? String(body.user_id) : adminUser.id;
+      await bumpTokenVersion(targetId);
+      if (req) logSecurityEvent("logout_all", clientIp(req), { userId: targetId, email: adminUser.email, details: "Admin forced logout of all sessions" });
+      return jsonRes({ message: targetId === adminUser.id ? "All your Admin sessions logged out." : "All user sessions logged out." });
     }
 
     return jsonRes({ error: `Unknown admin action: ${action}` }, 400);
