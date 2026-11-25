@@ -338,6 +338,9 @@ function calcProjectedBalance(principalInr: number, dailyRatePct: number, days: 
 function todayIst(): string {
   return new Date(Date.now() + 5.5 * 3600 * 1000).toISOString().slice(0, 10);
 }
+function yesterdayIst(): string {
+  return new Date(Date.now() + 5.5 * 3600 * 1000 - 86400_000).toISOString().slice(0, 10);
+}
 
 // ----------------------------------------------------------------------------
 // Redis -> PostgreSQL Batch Flush Worker (with Orphan Recovery & Mutex Wait)
@@ -397,7 +400,7 @@ async function flushPendingCaptchas(): Promise<{ users: number; captchas: number
 
 setInterval(() => { flushPendingCaptchas().catch(() => {}); }, FLUSH_INTERVAL_MS);
 
-// Built-in IST Daily Compounding Scheduler (runs once per day after 00:05 IST)
+// Built-in IST Daily Compounding & Level Income Scheduler (runs once per day after 00:05 IST)
 setInterval(async () => {
   try {
     const istNow = new Date(Date.now() + 5.5 * 3600 * 1000);
@@ -410,6 +413,11 @@ setInterval(async () => {
           const [r] = await sql`select public.run_daily_compounding_batch(${day}::date, 5000) as res`;
           more = Boolean(r?.res?.has_more);
         }
+      }
+      const yday = yesterdayIst();
+      const incLock = await redis.set(`cron:daily_income:${yday}`, "1", "EX", 86400, "NX");
+      if (incLock) {
+        await runDailyLevelIncomeForDate(yday).catch((e) => console.error("[daily level income cron]", e));
       }
     }
   } catch (e) {
@@ -458,6 +466,8 @@ async function getCachedConfigRow(cacheKey: string, queryFn: () => Promise<any[]
 
 const DEFAULT_INCOME_CONFIG = {
   income_enabled: true,
+  level_require_full_captcha: true,
+  active_levels: 8,
   captcha_daily_limit: 50,
   captcha_reward_usdt: 0.01,
   captcha_reward_inr: 1,
@@ -485,6 +495,8 @@ function normalizeIncomeSettings(row: Record<string, any> | null | undefined) {
     ...DEFAULT_INCOME_CONFIG,
     ...extra,
     income_enabled: extra.income_enabled !== undefined ? Boolean(extra.income_enabled) : true,
+    level_require_full_captcha: extra.level_require_full_captcha !== undefined ? Boolean(extra.level_require_full_captcha) : true,
+    active_levels: Math.min(8, Math.max(1, Math.round(Number(extra.active_levels ?? 8)))),
     captcha_daily_limit: Math.max(0, Number(row?.captcha_daily_limit ?? extra.captcha_daily_limit ?? 50)),
     captcha_reward_usdt: capUsdt,
     captcha_reward_inr: Number(extra.captcha_reward_inr ?? Math.round(capUsdt * USDT_INR_RATE * 100) / 100),
@@ -692,6 +704,435 @@ async function logSecurityEvent(
   } catch {}
 }
 
+let incomeTablesPromise: Promise<void> | null = null;
+function ensureIncomeTables(): Promise<void> {
+  if (!incomeTablesPromise) {
+    incomeTablesPromise = (async () => {
+      try {
+        await sql`
+          create table if not exists public.daily_captcha_completions (
+            user_id uuid not null references public.users(id) on delete cascade,
+            completion_date date not null,
+            captchas_done integer not null default 0,
+            daily_limit integer not null default 50,
+            completed_at timestamptz not null default now(),
+            primary key (user_id, completion_date)
+          )
+        `;
+        await sql`create index if not exists idx_daily_cap_comp_date on public.daily_captcha_completions(completion_date, user_id)`;
+        await sql`
+          create table if not exists public.level_once_claims (
+            ancestor_id uuid not null references public.users(id) on delete cascade,
+            member_id uuid not null references public.users(id) on delete cascade,
+            lvl integer not null check (lvl between 1 and 8),
+            amount_usdt numeric(14, 4) not null default 0,
+            created_at timestamptz not null default now(),
+            primary key (ancestor_id, member_id)
+          )
+        `;
+        await sql`
+          create table if not exists public.level_daily_claims (
+            ancestor_id uuid not null references public.users(id) on delete cascade,
+            member_id uuid not null references public.users(id) on delete cascade,
+            income_date date not null,
+            lvl integer not null check (lvl between 1 and 8),
+            amount_usdt numeric(14, 4) not null default 0,
+            created_at timestamptz not null default now(),
+            primary key (ancestor_id, member_id, income_date)
+          )
+        `;
+        await sql`
+          create table if not exists public.bonus_claims (
+            user_id uuid not null references public.users(id) on delete cascade,
+            bonus_type text not null,
+            claim_key text not null,
+            amount_usdt numeric(14, 4) not null default 0,
+            created_at timestamptz not null default now(),
+            primary key (user_id, bonus_type, claim_key)
+          )
+        `;
+        await sql`insert into public.income_settings (id) values (1) on conflict (id) do nothing`;
+        await sql`insert into public.compounding_settings (id) values (1) on conflict (id) do nothing`;
+      } catch (e) {
+        console.error("[ensureIncomeTables]", e);
+      }
+    })();
+  }
+  return incomeTablesPromise;
+}
+ensureIncomeTables();
+
+async function getSpentInrForDay(day: string): Promise<number> {
+  const [[spentRow], pendingRows] = await Promise.all([
+    sql`
+      select coalesce(sum(amount), 0) as total_usdt
+      from public.wallet_ledger
+      where amount > 0
+        and entry_type in ('captcha_income','signup_bonus','fast_start_bonus','streak_bonus','level_once','level_daily')
+        and (created_at at time zone 'Asia/Kolkata')::date = ${day}::date
+    `,
+    day === todayIst() ? redis.hvals("pending:captchas").catch(() => []) : Promise.resolve([]),
+  ]);
+  const pendingUsdt = (pendingRows || []).reduce((acc: number, v: string) => acc + Number((v || "0:0").split(":")[1] || 0), 0);
+  return Math.round((Number(spentRow?.total_usdt || 0) + pendingUsdt) * USDT_INR_RATE * 100) / 100;
+}
+
+async function creditSignupBonusIfEligible(userId: string): Promise<number> {
+  await ensureIncomeTables();
+  const inc = await getCachedIncomeSettings();
+  const bonusInr = Math.max(0, Number(inc.signup_bonus_inr ?? Math.round(Number(inc.signup_bonus_usdt || 0) * USDT_INR_RATE * 100) / 100));
+  if (inc.income_enabled === false || bonusInr <= 0) return 0;
+
+  const [prof] = await sql`select id, account_status, device_token from public.profiles where id = ${userId}::uuid limit 1`;
+  if (!prof || prof.account_status !== "active") return 0;
+  if (prof.device_token) {
+    const dupDev = await sql`
+      select 1 from public.bonus_claims bc
+      join public.profiles p on p.id = bc.user_id
+      where bc.bonus_type = 'signup_bonus' and p.device_token = ${prof.device_token} and bc.user_id <> ${userId}::uuid
+      limit 1
+    `;
+    if (dupDev.length) return 0;
+  }
+
+  const today = todayIst();
+  const capInr = Math.max(0, Number(inc.daily_company_cap_inr ?? 50000));
+  const spent = capInr > 0 ? await getSpentInrForDay(today) : 0;
+  if (capInr <= 0 || spent + bonusInr > capInr) return 0;
+
+  const amtUsdt = Math.round((bonusInr / USDT_INR_RATE) * 10000) / 10000;
+  if (amtUsdt <= 0) return 0;
+  const ins = await sql`
+    insert into public.bonus_claims (user_id, bonus_type, claim_key, amount_usdt)
+    values (${userId}::uuid, 'signup_bonus', 'once', ${amtUsdt})
+    on conflict (user_id, bonus_type, claim_key) do nothing
+    returning user_id
+  `;
+  if (!ins.length) return 0;
+  await sql`
+    insert into public.wallet_ledger (user_id, entry_type, amount, description)
+    values (${userId}::uuid, 'signup_bonus', ${amtUsdt}, ${`Signup welcome bonus (₹${bonusInr})`})
+  `;
+  return bonusInr;
+}
+
+async function checkAndCreditFastStartBonus(sponsorId: string): Promise<number> {
+  await ensureIncomeTables();
+  const inc = await getCachedIncomeSettings();
+  const bonusInr = Math.max(0, Number(inc.fast_start_bonus_inr ?? Math.round(Number(inc.fast_start_bonus_usdt || 0) * USDT_INR_RATE * 100) / 100));
+  const reqDirects = Math.max(1, Math.round(Number(inc.fast_start_directs ?? 5)));
+  if (inc.income_enabled === false || bonusInr <= 0) return 0;
+
+  const [sp] = await sql`
+    select p.id, p.account_status, p.created_at,
+           (select count(*)::integer from public.profiles d
+            where d.referred_by = p.id
+              and d.account_status = 'active'
+              and d.created_at <= p.created_at + interval '24 hours') as fast_directs
+    from public.profiles p
+    where p.id = ${sponsorId}::uuid
+    limit 1
+  `;
+  if (!sp || sp.account_status !== "active" || Number(sp.fast_directs || 0) < reqDirects) return 0;
+
+  const today = todayIst();
+  const capInr = Math.max(0, Number(inc.daily_company_cap_inr ?? 50000));
+  const spent = capInr > 0 ? await getSpentInrForDay(today) : 0;
+  if (capInr <= 0 || spent + bonusInr > capInr) return 0;
+
+  const amtUsdt = Math.round((bonusInr / USDT_INR_RATE) * 10000) / 10000;
+  if (amtUsdt <= 0) return 0;
+  const ins = await sql`
+    insert into public.bonus_claims (user_id, bonus_type, claim_key, amount_usdt)
+    values (${sponsorId}::uuid, 'fast_start_bonus', 'once', ${amtUsdt})
+    on conflict (user_id, bonus_type, claim_key) do nothing
+    returning user_id
+  `;
+  if (!ins.length) return 0;
+  await sql`
+    insert into public.wallet_ledger (user_id, entry_type, amount, description)
+    values (${sponsorId}::uuid, 'fast_start_bonus', ${amtUsdt}, ${`Fast-start bonus (${reqDirects} directs within 24h)`})
+  `;
+  return bonusInr;
+}
+
+async function checkAndCreditStreakBonus(userId: string, day: string): Promise<number> {
+  await ensureIncomeTables();
+  const inc = await getCachedIncomeSettings();
+  const bonusInr = Math.max(0, Number(inc.streak_bonus_inr ?? Math.round(Number(inc.streak_bonus_usdt || 0) * USDT_INR_RATE * 100) / 100));
+  const reqDays = Math.max(1, Math.round(Number(inc.streak_days ?? 7)));
+  const limit = Math.max(0, Number(inc.captcha_daily_limit ?? 50));
+  if (inc.income_enabled === false || bonusInr <= 0 || limit <= 0) return 0;
+
+  const [chk] = await sql`
+    select
+      (select count(*)::integer from public.daily_captcha_completions
+       where user_id = ${userId}::uuid
+         and completion_date between (${day}::date - (${reqDays}::integer - 1)) and ${day}::date
+         and captchas_done >= ${limit}) as streak_cnt,
+      exists(
+        select 1 from public.bonus_claims
+        where user_id = ${userId}::uuid
+          and bonus_type = 'streak_bonus'
+          and claim_key ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+          and claim_key::date > (${day}::date - ${reqDays}::integer)
+          and claim_key::date <= ${day}::date
+      ) as recently_claimed
+  `;
+  if (!chk || Number(chk.streak_cnt || 0) < reqDays || chk.recently_claimed) return 0;
+
+  const capInr = Math.max(0, Number(inc.daily_company_cap_inr ?? 50000));
+  const spent = capInr > 0 ? await getSpentInrForDay(day) : 0;
+  if (capInr <= 0 || spent + bonusInr > capInr) return 0;
+
+  const amtUsdt = Math.round((bonusInr / USDT_INR_RATE) * 10000) / 10000;
+  if (amtUsdt <= 0) return 0;
+  const ins = await sql`
+    insert into public.bonus_claims (user_id, bonus_type, claim_key, amount_usdt)
+    values (${userId}::uuid, 'streak_bonus', ${day}, ${amtUsdt})
+    on conflict (user_id, bonus_type, claim_key) do nothing
+    returning user_id
+  `;
+  if (!ins.length) return 0;
+  await sql`
+    insert into public.wallet_ledger (user_id, entry_type, amount, description)
+    values (${userId}::uuid, 'streak_bonus', ${amtUsdt}, ${`${reqDays}-day captcha streak bonus (${day})`})
+  `;
+  return bonusInr;
+}
+
+async function processLevelIncomeForCompletion(
+  userId: string,
+  day: string,
+  opts: { captchasDone?: number; skipRecordCompletion?: boolean } = {}
+): Promise<{ credited_count: number; credited_inr: number }> {
+  await ensureIncomeTables();
+  const inc = await getCachedIncomeSettings();
+  const limit = Math.max(0, Number(inc.captcha_daily_limit ?? 50));
+  if (inc.income_enabled === false || limit <= 0) return { credited_count: 0, credited_inr: 0 };
+
+  const requireFull = inc.level_require_full_captcha !== false;
+  if (!opts.skipRecordCompletion && Number(opts.captchasDone || 0) >= limit) {
+    await sql`
+      insert into public.daily_captcha_completions (user_id, completion_date, captchas_done, daily_limit, completed_at)
+      values (${userId}::uuid, ${day}::date, ${Math.round(Number(opts.captchasDone))}, ${limit}, now())
+      on conflict (user_id, completion_date) do update set
+        captchas_done = greatest(public.daily_captcha_completions.captchas_done, excluded.captchas_done),
+        daily_limit = excluded.daily_limit
+    `;
+  }
+
+  const [meRow] = await sql`
+    select p.account_status,
+           coalesce(dc.captchas_done, 0) as done_count,
+           (select count(*)::integer from public.profiles d where d.referred_by = p.id and d.account_status = 'active') as active_directs
+    from public.profiles p
+    left join public.daily_captcha_completions dc on dc.user_id = p.id and dc.completion_date = ${day}::date
+    where p.id = ${userId}::uuid
+    limit 1
+  `;
+  if (!meRow || meRow.account_status !== "active") return { credited_count: 0, credited_inr: 0 };
+  if (requireFull && Number(meRow.done_count || 0) < limit) {
+    return { credited_count: 0, credited_inr: 0 };
+  }
+
+  const companyCap = Math.max(0, Number(inc.daily_company_cap_inr ?? 50000));
+  const spentToday = companyCap > 0 ? await getSpentInrForDay(day) : 0;
+  let remCap = companyCap > 0 ? Math.max(0, companyCap - spentToday) : 0;
+  if (remCap <= 0) return { credited_count: 0, credited_inr: 0 };
+
+  const maxLevels = Math.min(8, Math.max(1, Math.round(Number(inc.active_levels ?? 8))));
+  const onceArr: number[] = Array.isArray(inc.level_once_inr) ? inc.level_once_inr : [];
+  const dailyArr: number[] = Array.isArray(inc.level_daily_inr) ? inc.level_daily_inr : [];
+  const directsArr: number[] = Array.isArray(inc.level_daily_directs) ? inc.level_daily_directs : [];
+
+  let creditedCount = 0;
+  let creditedInr = 0;
+
+  await checkAndCreditStreakBonus(userId, day).catch(() => 0);
+
+  // Pass A: userId completed all captchas -> reward eligible ancestors L1..maxLevels
+  const ancestors = await sql`
+    with recursive anc as (
+      select p.id as member_id, p.referred_by as ancestor_id, 1 as lvl, array[p.id] as path
+      from public.profiles p
+      where p.id = ${userId}::uuid and p.referred_by is not null
+      union all
+      select a.member_id, pr.referred_by as ancestor_id, a.lvl + 1, a.path || pr.id
+      from anc a
+      join public.profiles pr on pr.id = a.ancestor_id
+      where a.lvl < ${maxLevels} and pr.referred_by is not null and not (pr.referred_by = any(a.path))
+    )
+    select a.ancestor_id, a.lvl, ap.account_status,
+           exists(
+             select 1 from public.daily_captcha_completions dc
+             where dc.user_id = a.ancestor_id and dc.completion_date = ${day}::date and dc.captchas_done >= ${limit}
+           ) as anc_full_done,
+           (select count(*)::integer from public.profiles d where d.referred_by = a.ancestor_id and d.account_status = 'active') as active_directs
+    from anc a
+    join public.profiles ap on ap.id = a.ancestor_id
+    order by a.lvl asc
+  `;
+
+  for (const r of ancestors) {
+    if (r.account_status !== "active") continue;
+    if (Number(r.lvl) === 1) {
+      await checkAndCreditFastStartBonus(String(r.ancestor_id)).catch(() => 0);
+    }
+    if (requireFull && !r.anc_full_done) continue;
+    const lvl = Number(r.lvl);
+    if (lvl > maxLevels) continue;
+    const onceInr = Math.max(0, Number(onceArr[lvl - 1] || 0));
+    if (onceInr > 0 && onceInr <= remCap) {
+      const amtUsdt = Math.round((onceInr / USDT_INR_RATE) * 10000) / 10000;
+      const ins = await sql`
+        insert into public.level_once_claims (ancestor_id, member_id, lvl, amount_usdt)
+        values (${r.ancestor_id}::uuid, ${userId}::uuid, ${lvl}, ${amtUsdt})
+        on conflict (ancestor_id, member_id) do nothing
+        returning ancestor_id
+      `;
+      if (ins.length) {
+        await sql`
+          insert into public.wallet_ledger (user_id, entry_type, amount, description)
+          values (${r.ancestor_id}::uuid, 'level_once', ${amtUsdt}, ${`Level ${lvl} one-time team income (full captcha completed)`})
+        `;
+        remCap -= onceInr;
+        creditedInr += onceInr;
+        creditedCount++;
+      }
+    }
+    const dailyInr = Math.max(0, Number(dailyArr[lvl - 1] || 0));
+    const minDir = Math.max(0, Number(directsArr[lvl - 1] || 0));
+    if (dailyInr > 0 && Number(r.active_directs || 0) >= minDir && dailyInr <= remCap) {
+      const amtUsdt = Math.round((dailyInr / USDT_INR_RATE) * 10000) / 10000;
+      const ins = await sql`
+        insert into public.level_daily_claims (ancestor_id, member_id, income_date, lvl, amount_usdt)
+        values (${r.ancestor_id}::uuid, ${userId}::uuid, ${day}::date, ${lvl}, ${amtUsdt})
+        on conflict (ancestor_id, member_id, income_date) do nothing
+        returning ancestor_id
+      `;
+      if (ins.length) {
+        await sql`
+          insert into public.wallet_ledger (user_id, entry_type, amount, description)
+          values (${r.ancestor_id}::uuid, 'level_daily', ${amtUsdt}, ${`Level ${lvl} daily team income (${day})`})
+        `;
+        remCap -= dailyInr;
+        creditedInr += dailyInr;
+        creditedCount++;
+      }
+    }
+  }
+
+  // Pass B: userId also completed all captchas -> claim from downlines L1..maxLevels who already completed today
+  const myDirects = Number(meRow.active_directs || 0);
+  const downlines = await sql`
+    with recursive down as (
+      select p.id as member_id, 1 as lvl, array[p.id] as path
+      from public.profiles p
+      where p.referred_by = ${userId}::uuid
+      union all
+      select c.id as member_id, d.lvl + 1, d.path || c.id
+      from public.profiles c
+      join down d on c.referred_by = d.member_id
+      where d.lvl < ${maxLevels} and not (c.id = any(d.path))
+    )
+    select d.member_id, d.lvl
+    from down d
+    join public.profiles mp on mp.id = d.member_id
+    join public.daily_captcha_completions dc on dc.user_id = d.member_id and dc.completion_date = ${day}::date
+    where mp.account_status = 'active' and dc.captchas_done >= ${limit}
+    order by d.lvl asc
+  `;
+
+  for (const m of downlines) {
+    const lvl = Number(m.lvl);
+    if (lvl > maxLevels) continue;
+    const onceInr = Math.max(0, Number(onceArr[lvl - 1] || 0));
+    if (onceInr > 0 && onceInr <= remCap) {
+      const amtUsdt = Math.round((onceInr / USDT_INR_RATE) * 10000) / 10000;
+      const ins = await sql`
+        insert into public.level_once_claims (ancestor_id, member_id, lvl, amount_usdt)
+        values (${userId}::uuid, ${m.member_id}::uuid, ${lvl}, ${amtUsdt})
+        on conflict (ancestor_id, member_id) do nothing
+        returning ancestor_id
+      `;
+      if (ins.length) {
+        await sql`
+          insert into public.wallet_ledger (user_id, entry_type, amount, description)
+          values (${userId}::uuid, 'level_once', ${amtUsdt}, ${`Level ${lvl} one-time team income (full captcha completed)`})
+        `;
+        remCap -= onceInr;
+        creditedInr += onceInr;
+        creditedCount++;
+      }
+    }
+    const dailyInr = Math.max(0, Number(dailyArr[lvl - 1] || 0));
+    const minDir = Math.max(0, Number(directsArr[lvl - 1] || 0));
+    if (dailyInr > 0 && myDirects >= minDir && dailyInr <= remCap) {
+      const amtUsdt = Math.round((dailyInr / USDT_INR_RATE) * 10000) / 10000;
+      const ins = await sql`
+        insert into public.level_daily_claims (ancestor_id, member_id, income_date, lvl, amount_usdt)
+        values (${userId}::uuid, ${m.member_id}::uuid, ${day}::date, ${lvl}, ${amtUsdt})
+        on conflict (ancestor_id, member_id, income_date) do nothing
+        returning ancestor_id
+      `;
+      if (ins.length) {
+        await sql`
+          insert into public.wallet_ledger (user_id, entry_type, amount, description)
+          values (${userId}::uuid, 'level_daily', ${amtUsdt}, ${`Level ${lvl} daily team income (${day})`})
+        `;
+        remCap -= dailyInr;
+        creditedInr += dailyInr;
+        creditedCount++;
+      }
+    }
+  }
+
+  return { credited_count: creditedCount, credited_inr: Math.round(creditedInr * 100) / 100 };
+}
+
+async function runDailyLevelIncomeForDate(day: string): Promise<{ day: string; completed_users: number; credits: number; total_inr: number }> {
+  await ensureIncomeTables();
+  if (day === todayIst()) {
+    await flushPendingCaptchas();
+  }
+  const inc = await getCachedIncomeSettings();
+  const limit = Math.max(0, Number(inc.captcha_daily_limit ?? 50));
+  if (inc.income_enabled === false || limit <= 0) {
+    return { day, completed_users: 0, credits: 0, total_inr: 0 };
+  }
+  await sql`
+    insert into public.daily_captcha_completions (user_id, completion_date, captchas_done, daily_limit, completed_at)
+    select id, today_captchas_date, today_captchas_count, ${limit}, now()
+    from public.profiles
+    where today_captchas_date = ${day}::date and today_captchas_count >= ${limit}
+    on conflict (user_id, completion_date) do update set
+      captchas_done = greatest(public.daily_captcha_completions.captchas_done, excluded.captchas_done)
+  `;
+  const completedRows = await sql`
+    select dc.user_id
+    from public.daily_captcha_completions dc
+    join public.profiles p on p.id = dc.user_id
+    where dc.completion_date = ${day}::date and dc.captchas_done >= ${limit} and p.account_status = 'active'
+  `;
+  let totalCredits = 0;
+  let totalInr = 0;
+  for (const row of completedRows) {
+    const res = await processLevelIncomeForCompletion(String(row.user_id), day, { skipRecordCompletion: true });
+    totalCredits += res.credited_count;
+    totalInr += res.credited_inr;
+  }
+  const totalUsdt = Math.round((totalInr / USDT_INR_RATE) * 10000) / 10000;
+  await sql`
+    insert into public.income_runs (run_date, users_credited, total_usdt)
+    values (${day}::date, ${totalCredits}, ${totalUsdt})
+    on conflict (run_date) do update set
+      users_credited = public.income_runs.users_credited + excluded.users_credited,
+      total_usdt = public.income_runs.total_usdt + excluded.total_usdt
+  `;
+  return { day, completed_users: completedRows.length, credits: totalCredits, total_inr: Math.round(totalInr * 100) / 100 };
+}
+
 async function getCachedMonetizationPublic() {
   return await getCachedConfigRow(
     "cache:monetization_public",
@@ -848,6 +1289,7 @@ async function handleAuth(pathname: string, req: Request): Promise<Response> {
     `;
     safeIncrIfCached("cache:users_count");
     safeIncrIfCached("cache:reg_count");
+    await creditSignupBonusIfEligible(u.id).catch(() => 0);
     logSecurityEvent("signup_success", ip, { userId: u.id, email: u.email, deviceFp: dfp, details: "5-layer account registered" });
 
     const access_token = await issueJwt({ id: u.id, email: u.email, role: u.role }, dfp, 1);
@@ -1085,6 +1527,13 @@ async function routeRequest(req: Request): Promise<Response> {
         if (!cfg || !constantTimeEqual(secret, String(cfg.postback_secret || ""))) {
           return jsonRes({ error: "Invalid postback secret." }, 403);
         }
+        if (!cfg.offerwall_enabled) {
+          return jsonRes({ error: "Offerwall is currently disabled by Admin." }, 403);
+        }
+        const incCfg = await getCachedIncomeSettings();
+        if (incCfg.income_enabled === false) {
+          return jsonRes({ error: "Income payouts are currently paused by Admin." }, 403);
+        }
         if (!UUID_RE.test(userId)) return jsonRes({ error: "Invalid user_id." }, 400);
         if (!txId) return jsonRes({ error: "tx_id is required." }, 400);
         if (!Number.isFinite(payoutRaw) || payoutRaw <= 0 || payoutRaw > 5000) {
@@ -1197,12 +1646,17 @@ async function routeRequest(req: Request): Promise<Response> {
               device_token = coalesce(device_token, ${deviceToken || null})
           where id = ${user.id}
         `;
+        await creditSignupBonusIfEligible(user.id).catch(() => 0);
+        if (sponsorId) {
+          await checkAndCreditFastStartBonus(String(sponsorId)).catch(() => 0);
+        }
         return jsonRes({ ok: true, needs_details: false }, 200, req);
       }
 
       if (!prof.device_token && deviceToken) {
         await sql`update public.profiles set device_token = ${deviceToken} where id = ${user.id}`;
       }
+      await creditSignupBonusIfEligible(user.id).catch(() => 0);
       return jsonRes({ ok: true, needs_details: !prof.full_name }, 200, req);
     }
 
@@ -1282,7 +1736,13 @@ async function handleUserFinance(action: string, body: Record<string, any>, user
       const limit = Math.max(0, Number(incSet.captcha_daily_limit ?? 50));
       const rewardUsdt = Math.max(0, Number(incSet.captcha_reward_usdt ?? 0.01));
       const rewardInr = Math.round(rewardUsdt * USDT_INR_RATE * 100) / 100;
-      if (limit > 0 && state.todayPassed >= limit) {
+      if (state.todayPassed >= limit) {
+        if (limit > 0) {
+          const markKey = `cap_comp_mark:${todayIst()}:${user.id}`;
+          if (await redis.set(markKey, "1", "EX", 100_000, "NX")) {
+            await processLevelIncomeForCompletion(user.id, todayIst(), { captchasDone: state.todayPassed }).catch(() => {});
+          }
+        }
         return jsonRes({
           limit_reached: true,
           today_passed: state.todayPassed,
@@ -1341,16 +1801,40 @@ async function handleUserFinance(action: string, body: Record<string, any>, user
       }
 
       const incomeEnabled = incSet.income_enabled !== false;
-      const rewardPaid = incomeEnabled && newCount <= limit && rewardUsdt > 0;
+      const companyCap = Math.max(0, Number(incSet.daily_company_cap_inr ?? 50000));
+      let withinCap = companyCap > 0;
+      if (incomeEnabled && withinCap && rewardUsdt > 0) {
+        const capCacheKey = `cache:spent_inr:${todayIst()}`;
+        let spentStr = await redis.get(capCacheKey);
+        if (spentStr === null) {
+          const spentNow = await getSpentInrForDay(todayIst());
+          await redis.set(capCacheKey, String(spentNow), "EX", 10);
+          spentStr = String(spentNow);
+        }
+        if (Number(spentStr) + rewardInr > companyCap) {
+          withinCap = false;
+        }
+      }
+      const rewardPaid = incomeEnabled && withinCap && newCount <= limit && rewardUsdt > 0;
       if (rewardPaid) {
         await redis.eval(LUA_ADD_PENDING, 1, "pending:captchas", user.id, "1", String(rewardUsdt));
+        await redis.incrbyfloat(`cache:spent_inr:${todayIst()}`, rewardInr).catch(() => {});
       }
       const limitReached = newCount >= limit;
+      let levelUnlocked = false;
+      let levelCreditedInr = 0;
+      if (limitReached && limit > 0) {
+        levelUnlocked = true;
+        const lvlRes = await processLevelIncomeForCompletion(user.id, todayIst(), { captchasDone: newCount }).catch(() => ({ credited_count: 0, credited_inr: 0 }));
+        levelCreditedInr = lvlRes.credited_inr;
+      }
       const next = limitReached ? null : await issueCaptchaChallenge(user.id);
       return jsonRes({
         ok: true,
         reward_paid: rewardPaid,
         limit_reached: limitReached,
+        level_unlocked: levelUnlocked,
+        level_credited_inr: levelCreditedInr,
         today_passed: newCount,
         captcha_daily_limit: limit,
         reward_inr: rewardInr,
@@ -2007,8 +2491,19 @@ async function handleAdminControl(
     }
 
     if (action === "set_levels") {
-      await sql`update public.app_settings set level_count = ${Number(body.level_count)}, level_income = ${JSON.stringify(body.level_income || [])}::jsonb where id = 1`;
+      const cnt = Math.min(8, Math.max(1, Math.round(Number(body.level_count || 8))));
+      const lvlInc = Array.isArray(body.level_income) ? body.level_income.map((n: any) => Math.max(0, Number(n) || 0)) : [];
+      await sql`update public.app_settings set level_count = ${cnt}, level_income = ${JSON.stringify(lvlInc)}::jsonb where id = 1`;
       await redis.del("cache:app_settings");
+      const [curRow] = await sql`select * from public.income_settings where id = 1`;
+      const cur = normalizeIncomeSettings(curRow || {});
+      const extra = { ...cur, active_levels: cnt, level_daily_inr: lvlInc.length === 8 ? lvlInc : cur.level_daily_inr };
+      await sql`
+        insert into public.income_settings (id, extra_config, updated_at)
+        values (1, ${JSON.stringify(extra)}::jsonb, now())
+        on conflict (id) do update set extra_config = excluded.extra_config, updated_at = now()
+      `;
+      await redis.del("cache:income_settings");
       return jsonRes({ message: "Level settings saved." });
     }
     if (action === "set_device_lock") {
@@ -2027,9 +2522,16 @@ async function handleAdminControl(
       return jsonRes({ message: "Registration limit updated." });
     }
     if (action === "get_captcha_mode") {
-      const s = await getCachedAppSettings();
+      const [s, inc] = await Promise.all([getCachedAppSettings(), getCachedIncomeSettings()]);
       const cm = parseCaptchaMode(s?.captcha_mode);
-      return jsonRes({ random_enabled: cm.random_enabled, length: cm.length, mode: cm.random_enabled ? "standard" : "off" });
+      return jsonRes({
+        random_enabled: cm.random_enabled,
+        length: cm.length,
+        mode: cm.random_enabled ? "standard" : "off",
+        captcha_daily_limit: inc.captcha_daily_limit,
+        captcha_reward_inr: inc.captcha_reward_inr,
+        income_enabled: inc.income_enabled,
+      });
     }
     if (action === "set_captcha_mode") {
       const randomEnabled = body.random_enabled !== undefined ? Boolean(body.random_enabled) : String(body.mode || "standard") !== "off";
@@ -2041,7 +2543,47 @@ async function handleAdminControl(
         on conflict (id) do update set captcha_mode = excluded.captcha_mode, updated_at = now()
       `;
       await redis.del("cache:app_settings");
-      return jsonRes({ message: `Captcha updated (${randomEnabled ? "ON" : "OFF"}, ${len} chars).`, random_enabled: randomEnabled, length: len });
+
+      const [curRow] = await sql`select * from public.income_settings where id = 1`;
+      const cur = normalizeIncomeSettings(curRow || {});
+      const rawLimit = Number(body.captcha_daily_limit);
+      const hasLimit = body.captcha_daily_limit !== undefined && Number.isFinite(rawLimit);
+      const newLimit = hasLimit ? Math.max(0, Math.min(5000, Math.round(rawLimit))) : cur.captcha_daily_limit;
+      const rawRewardInr = Number(body.captcha_reward_inr);
+      const hasReward = body.captcha_reward_inr !== undefined && Number.isFinite(rawRewardInr);
+      const newRewardInr = hasReward ? Math.max(0, Math.round(rawRewardInr * 100) / 100) : cur.captcha_reward_inr;
+      const newRewardUsdt = hasReward ? Math.max(0, Math.round((newRewardInr / USDT_INR_RATE) * 10000) / 10000) : cur.captcha_reward_usdt;
+
+      if (hasLimit || hasReward) {
+        const extra = {
+          ...cur,
+          captcha_daily_limit: newLimit,
+          captcha_reward_inr: newRewardInr,
+          captcha_reward_usdt: newRewardUsdt,
+        };
+        await sql`
+          insert into public.income_settings (
+            id, captcha_daily_limit, captcha_reward_usdt, signup_bonus_usdt,
+            fast_start_bonus_usdt, streak_bonus_usdt, extra_config, updated_at
+          ) values (
+            1, ${newLimit}, ${newRewardUsdt}, ${cur.signup_bonus_usdt}, ${cur.fast_start_bonus_usdt}, ${cur.streak_bonus_usdt}, ${JSON.stringify(extra)}::jsonb, now()
+          )
+          on conflict (id) do update set
+            captcha_daily_limit = excluded.captcha_daily_limit,
+            captcha_reward_usdt = excluded.captcha_reward_usdt,
+            extra_config = excluded.extra_config,
+            updated_at = now()
+        `;
+        await redis.del("cache:income_settings");
+      }
+
+      return jsonRes({
+        message: `Captcha saved! ${randomEnabled ? "ON" : "OFF"} · Daily Limit: ${newLimit} · Reward: ₹${newRewardInr} · Length: ${len} chars.`,
+        random_enabled: randomEnabled,
+        length: len,
+        captcha_daily_limit: newLimit,
+        captcha_reward_inr: newRewardInr,
+      });
     }
 
     if (action === "get_deposit_address") {
@@ -2152,8 +2694,13 @@ async function handleAdminControl(
         ? Math.max(0, Math.round((rawStreakInr / USDT_INR_RATE) * 10000) / 10000)
         : (body.streak_bonus_usdt !== undefined && Number.isFinite(Number(body.streak_bonus_usdt)) ? Math.max(0, Number(body.streak_bonus_usdt)) : cur.streak_bonus_usdt);
 
+      const activeLevels = body.active_levels !== undefined && Number.isFinite(Number(body.active_levels))
+        ? Math.min(8, Math.max(1, Math.round(Number(body.active_levels))))
+        : cur.active_levels;
       const extra = {
         income_enabled: body.income_enabled !== undefined ? Boolean(body.income_enabled) : cur.income_enabled,
+        level_require_full_captcha: body.level_require_full_captcha !== undefined ? Boolean(body.level_require_full_captcha) : cur.level_require_full_captcha,
+        active_levels: activeLevels,
         captcha_daily_limit: limit,
         captcha_reward_usdt: capUsdt,
         captcha_reward_inr: body.captcha_reward_inr !== undefined && Number.isFinite(rawCapInr) ? Math.max(0, rawCapInr) : Math.round(capUsdt * USDT_INR_RATE * 100) / 100,
@@ -2186,8 +2733,9 @@ async function handleAdminControl(
           extra_config = excluded.extra_config,
           updated_at = now()
       `;
-      await redis.del("cache:income_settings");
-      return jsonRes({ message: `Income settings saved! Daily Captcha Limit: ${limit}, Reward: ₹${extra.captcha_reward_inr}`, settings: extra });
+      await sql`update public.app_settings set level_count = ${activeLevels}, level_income = ${JSON.stringify(extra.level_daily_inr)}::jsonb where id = 1`;
+      await Promise.all([redis.del("cache:income_settings"), redis.del("cache:app_settings")]);
+      return jsonRes({ message: `Income settings saved! Daily Captcha Limit: ${limit}, Reward: ₹${extra.captcha_reward_inr}, Active Levels: ${activeLevels}`, settings: extra });
     }
     if (action === "income_summary") {
       const [[tot], [wal], byType] = await Promise.all([
@@ -2228,8 +2776,14 @@ async function handleAdminControl(
       return jsonRes({ entries });
     }
     if (action === "run_daily_income") {
-      await flushPendingCaptchas();
-      return jsonRes({ message: "Flushed pending Redis earnings to PostgreSQL." });
+      const targetDay = /^\d{4}-\d{2}-\d{2}$/.test(String(body.day || "").trim())
+        ? String(body.day).trim()
+        : yesterdayIst();
+      const res = await runDailyLevelIncomeForDate(targetDay);
+      return jsonRes({
+        message: `Daily income (${res.day}): ${res.completed_users} full-captcha users, ${res.credits} level credits (₹${res.total_inr.toFixed(2)}).`,
+        ...res,
+      });
     }
     if (action === "capacity_snapshot") {
       let memTotalMb = 0, memAvailMb = 0, swapTotalMb = 0, swapFreeMb = 0;
