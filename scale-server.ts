@@ -681,6 +681,90 @@ async function ensureSecurityTables() {
 }
 ensureSecurityTables();
 
+function generateScMemberIdCandidate(): string {
+  const buf = new Uint32Array(1);
+  crypto.getRandomValues(buf);
+  const num = buf[0] % 1_000_000;
+  return "SC" + String(num).padStart(6, "0");
+}
+
+async function allocateNextMemberId(): Promise<string> {
+  for (let i = 0; i < 30; i++) {
+    const mid = generateScMemberIdCandidate();
+    const [exists] = await sql`
+      select id from public.users where upper(coalesce(member_id, '')) = ${mid}
+      union all
+      select id from public.profiles where upper(coalesce(member_id, '')) = ${mid}
+      limit 1
+    `;
+    if (!exists) return mid;
+  }
+  const [seqRow] = await sql`select nextval('public.member_id_seq')::text as mid`;
+  return "SC" + String(seqRow?.mid || Date.now()).slice(-6).padStart(6, "0");
+}
+
+let _memberIdReadyPromise: Promise<void> | null = null;
+async function ensureMemberIdSchema(): Promise<void> {
+  if (!_memberIdReadyPromise) {
+    _memberIdReadyPromise = (async () => {
+      try {
+        await sql`create sequence if not exists public.member_id_seq start with 100001 increment by 1`;
+        await sql`alter table public.users add column if not exists member_id text`;
+        await sql`alter table public.profiles add column if not exists member_id text`;
+        await sql`create unique index if not exists idx_users_member_id on public.users(upper(member_id)) where coalesce(member_id, '') <> ''`;
+        await sql`create unique index if not exists idx_profiles_member_id on public.profiles(upper(member_id)) where coalesce(member_id, '') <> ''`;
+
+        // Sync where one table already has an alphanumeric SC-style member_id and the other does not
+        await sql`
+          update public.profiles p
+          set member_id = u.member_id
+          from public.users u
+          where u.id = p.id
+            and coalesce(u.member_id, '') <> ''
+            and u.member_id !~ '^[0-9]+$'
+            and (coalesce(p.member_id, '') = '' or p.member_id ~ '^[0-9]+$')
+        `;
+        await sql`
+          update public.users u
+          set member_id = p.member_id
+          from public.profiles p
+          where p.id = u.id
+            and coalesce(p.member_id, '') <> ''
+            and p.member_id !~ '^[0-9]+$'
+            and (coalesce(u.member_id, '') = '' or u.member_id ~ '^[0-9]+$')
+        `;
+
+        // Backfill ALL existing users without a member_id OR with legacy numeric-only member_id into SC + 6 digits
+        const missing = await sql`
+          select u.id from public.users u
+          left join public.profiles p on p.id = u.id
+          where coalesce(u.member_id, '') = ''
+             or u.member_id ~ '^[0-9]+$'
+             or coalesce(p.member_id, '') = ''
+             or p.member_id ~ '^[0-9]+$'
+          order by u.created_at asc
+        `;
+        for (const row of missing) {
+          const mid = await allocateNextMemberId();
+          await sql`
+            update public.users set member_id = ${mid}
+            where id = ${row.id} and (coalesce(member_id, '') = '' or member_id ~ '^[0-9]+$')
+          `;
+          await sql`
+            update public.profiles set member_id = ${mid}
+            where id = ${row.id} and (coalesce(member_id, '') = '' or member_id ~ '^[0-9]+$')
+          `;
+        }
+      } catch (e) {
+        _memberIdReadyPromise = null;
+        console.error("[ensureMemberIdSchema]", e);
+      }
+    })();
+  }
+  await _memberIdReadyPromise;
+}
+ensureMemberIdSchema();
+
 async function logSecurityEvent(
   eventType: string,
   ip: string,
@@ -1275,45 +1359,54 @@ async function handleAuth(pathname: string, req: Request): Promise<Response> {
     const dup = await sql`select id from public.users where lower(email) = ${email} limit 1`;
     if (dup.length) return jsonRes({ error: "Account already registered. Please log in." }, 400, req);
 
-    const [pwdHash, pinHash] = await Promise.all([hashPassword(password), hashPassword(pin)]);
+    await ensureMemberIdSchema();
+    const [pwdHash, pinHash, memberId] = await Promise.all([
+      hashPassword(password),
+      hashPassword(pin),
+      allocateNextMemberId(),
+    ]);
     const isAdmin = ADMIN_EMAILS.has(email);
     const role = isAdmin ? "admin" : "user";
     const [u] = await sql`
-      insert into public.users (email, password_hash, security_pin_hash, role, token_version)
-      values (${email}, ${pwdHash}, ${pinHash}, ${role}, 1)
-      returning id, email, role, created_at
+      insert into public.users (email, password_hash, security_pin_hash, role, token_version, member_id)
+      values (${email}, ${pwdHash}, ${pinHash}, ${role}, 1, ${memberId})
+      returning id, email, role, member_id, created_at
     `;
     await sql`
-      insert into public.profiles (id, email, referral_code, account_status, is_admin)
-      values (${u.id}, ${u.email}, ${"SC" + randomCode(6)}, 'active', ${isAdmin})
+      insert into public.profiles (id, email, member_id, referral_code, account_status, is_admin)
+      values (${u.id}, ${u.email}, ${memberId}, ${"SC" + randomCode(6)}, 'active', ${isAdmin})
     `;
     safeIncrIfCached("cache:users_count");
     safeIncrIfCached("cache:reg_count");
     await creditSignupBonusIfEligible(u.id).catch(() => 0);
-    logSecurityEvent("signup_success", ip, { userId: u.id, email: u.email, deviceFp: dfp, details: "5-layer account registered" });
+    logSecurityEvent("signup_success", ip, { userId: u.id, email: u.email, deviceFp: dfp, details: `5-layer account registered (ID: ${memberId})` });
 
     const access_token = await issueJwt({ id: u.id, email: u.email, role: u.role }, dfp, 1);
-    return jsonRes({ user: u, session: { access_token, user: u } }, 200, req);
+    const uOut = { ...u, member_id: memberId };
+    return jsonRes({ user: uOut, member_id: memberId, session: { access_token, user: uOut } }, 200, req);
   }
 
   if (pathname === "/api/auth/login" && req.method === "POST") {
     if (!(await checkRateLimit(`rl:login:${ip}`, 25, 300))) {
       return jsonRes({ error: "Too many login attempts from your network. Please wait 5 minutes." }, 429, req);
     }
+    await ensureMemberIdSchema();
     const body: any = await req.json().catch(() => ({}));
-    const email = String(body.email || "").trim().toLowerCase();
+    const rawIdent = String(body.login_id ?? body.email ?? "").trim();
+    const identLower = rawIdent.toLowerCase();
+    const identUpper = rawIdent.toUpperCase();
     const password = String(body.password || "");
     const pin = String(body.security_pin || "").trim();
     const totpCode = String(body.totp_code || "").trim();
     const dfp = hdrDfp || deviceFingerprint(String(body.device_token || ""));
 
-    if (!email || !password) return jsonRes({ error: "Email/ID and password are required." }, 400, req);
+    if (!rawIdent || !password) return jsonRes({ error: "User ID and password are required." }, 400, req);
 
     // Per-account brute-force lockout (5 fails -> 15 min lock)
-    const failKey = `login_fail:${sha256Hex(email).slice(0, 24)}`;
+    const failKey = `login_fail:${sha256Hex(identLower).slice(0, 24)}`;
     const fails = Number((await redis.get(failKey)) || 0);
     if (fails >= 5) {
-      logSecurityEvent("login_locked_attempt", ip, { email, deviceFp: dfp, details: "Account in 15m brute-force cooldown" });
+      logSecurityEvent("login_locked_attempt", ip, { email: rawIdent, deviceFp: dfp, details: "Account in 15m brute-force cooldown" });
       return jsonRes({ error: "Account temporarily locked for 15 minutes due to 5 failed attempts." }, 429, req);
     }
 
@@ -1327,13 +1420,28 @@ async function handleAuth(pathname: string, req: Request): Promise<Response> {
       return jsonRes({ error: "Cloudflare verification failed. Please retry." }, 400, req);
     }
 
-    const [u] = await sql`
-      select u.id, u.email, u.password_hash, u.security_pin_hash, u.totp_secret, u.totp_enabled,
-             coalesce(u.token_version, 1)::integer as token_version, u.role, p.account_status
-      from public.users u
-      left join public.profiles p on p.id = u.id
-      where lower(u.email) = ${email} limit 1
-    `;
+    const isEmailInput = rawIdent.includes("@");
+    const [u] = isEmailInput
+      ? await sql`
+          select u.id, u.email, coalesce(nullif(u.member_id, ''), p.member_id, '') as member_id,
+                 u.password_hash, u.security_pin_hash, u.totp_secret, u.totp_enabled,
+                 coalesce(u.token_version, 1)::integer as token_version, u.role, p.account_status
+          from public.users u
+          left join public.profiles p on p.id = u.id
+          where lower(u.email) = ${identLower} limit 1
+        `
+      : await sql`
+          select u.id, u.email, coalesce(nullif(u.member_id, ''), p.member_id, '') as member_id,
+                 u.password_hash, u.security_pin_hash, u.totp_secret, u.totp_enabled,
+                 coalesce(u.token_version, 1)::integer as token_version, u.role, p.account_status
+          from public.users u
+          left join public.profiles p on p.id = u.id
+          where upper(coalesce(nullif(u.member_id, ''), p.member_id, '')) = ${identUpper} limit 1
+        `;
+    if (!u && !isEmailInput && /^\d{10}$/.test(rawIdent)) {
+      return jsonRes({ error: "Please log in with your User ID (e.g. SC054697), not your mobile number." }, 401, req);
+    }
+    const email = String(u?.email || rawIdent);
     const recordFail = async (ev: string, reason: string) => {
       const n = await redis.incr(failKey);
       if (n === 1) await redis.expire(failKey, 900);
@@ -1390,9 +1498,10 @@ async function handleAuth(pathname: string, req: Request): Promise<Response> {
 
     // Shield 5: Device-bound JWT + Token Version
     const access_token = await issueJwt({ id: u.id, email: u.email, role: u.role }, dfp, u.token_version);
+    const uOut = { id: u.id, email: u.email, member_id: u.member_id || "", role: u.role, is_anonymous: false };
     return jsonRes({
-      user: { id: u.id, email: u.email, role: u.role, is_anonymous: false },
-      session: { access_token, user: { id: u.id, email: u.email, role: u.role, is_anonymous: false } },
+      user: uOut,
+      session: { access_token, user: uOut },
     }, 200, req);
   }
 
@@ -1416,8 +1525,11 @@ async function handleAuth(pathname: string, req: Request): Promise<Response> {
     if (!/^\d{4,6}$/.test(pin)) return jsonRes({ error: "Security PIN must be 4 to 6 digits." }, 400, req);
 
     const [u] = await sql`
-      select id, email, role, security_pin_hash, coalesce(token_version, 1)::integer as token_version
-      from public.users where id = ${setupData.uid} limit 1
+      select u.id, u.email, coalesce(nullif(u.member_id, ''), p.member_id, '') as member_id,
+             u.role, u.security_pin_hash, coalesce(u.token_version, 1)::integer as token_version
+      from public.users u
+      left join public.profiles p on p.id = u.id
+      where u.id = ${setupData.uid} limit 1
     `;
     if (!u) return jsonRes({ error: "Account not found." }, 404, req);
     if (u.security_pin_hash) return jsonRes({ error: "Security PIN is already set. Log in normally." }, 400, req);
@@ -1428,9 +1540,10 @@ async function handleAuth(pathname: string, req: Request): Promise<Response> {
     logSecurityEvent("pin_setup", ip, { userId: u.id, email: u.email, deviceFp: dfp, details: "Initial Security PIN activated" });
 
     const access_token = await issueJwt({ id: u.id, email: u.email, role: u.role }, dfp, u.token_version);
+    const uOut = { id: u.id, email: u.email, member_id: u.member_id || "", role: u.role, is_anonymous: false };
     return jsonRes({
-      user: { id: u.id, email: u.email, role: u.role, is_anonymous: false },
-      session: { access_token, user: { id: u.id, email: u.email, role: u.role, is_anonymous: false } },
+      user: uOut,
+      session: { access_token, user: uOut },
       message: "5-Layer Security PIN activated!",
     }, 200, req);
   }
@@ -1438,7 +1551,8 @@ async function handleAuth(pathname: string, req: Request): Promise<Response> {
   if (pathname === "/api/auth/user" && req.method === "GET") {
     const user = await authenticateRequest(req);
     if (!user) return jsonRes({ user: null }, 200, req);
-    return jsonRes({ user: { ...user, is_anonymous: false } }, 200, req);
+    const [mRow] = await sql`select member_id from public.profiles where id = ${user.id} limit 1`;
+    return jsonRes({ user: { ...user, member_id: mRow?.member_id || "", is_anonymous: false } }, 200, req);
   }
 
   if (pathname === "/api/auth/update-user" && req.method === "POST") {
@@ -1584,8 +1698,9 @@ async function routeRequest(req: Request): Promise<Response> {
       if (table === "profiles") {
         const user = await authenticateRequest(req);
         if (!user) return jsonRes({ error: "Unauthorized" }, 401, req);
+        await ensureMemberIdSchema();
         const [row] = await sql`
-          select id, email, full_name, phone, gender, date_of_birth, city, state, pin_code,
+          select id, email, member_id, full_name, phone, gender, date_of_birth, city, state, pin_code,
                  referral_code, referred_by, account_status, balance_usdt, device_locked, is_admin, created_at
           from public.profiles where id = ${user.id} limit 1
         `;
@@ -2169,19 +2284,20 @@ async function handleAdminControl(
     }
 
     if (action === "list_users") {
+      await ensureMemberIdSchema();
       const q = String(body.query || "").trim();
       const lim = Math.min(200, Math.max(10, Number(body.limit) || 50));
       const users = q
         ? await sql`
-            select id, email, full_name,
+            select id, member_id, email, full_name,
                    case when length(coalesce(phone, '')) >= 4 then 'XXXXXX' || right(phone, 4) else '-' end as phone,
                    account_status, balance_usdt as wallet_balance, created_at
             from public.profiles
-            where email ilike ${"%" + q + "%"} or full_name ilike ${"%" + q + "%"} or phone ilike ${"%" + q + "%"}
+            where member_id ilike ${"%" + q + "%"} or email ilike ${"%" + q + "%"} or full_name ilike ${"%" + q + "%"} or phone ilike ${"%" + q + "%"}
             order by created_at desc limit ${lim}
           `
         : await sql`
-            select id, email, full_name,
+            select id, member_id, email, full_name,
                    case when length(coalesce(phone, '')) >= 4 then 'XXXXXX' || right(phone, 4) else '-' end as phone,
                    account_status, balance_usdt as wallet_balance, created_at
             from public.profiles order by created_at desc limit ${lim}
@@ -2191,27 +2307,94 @@ async function handleAdminControl(
 
     async function resolveAdminTargetUid(rawInput: unknown): Promise<string> {
       const q = String(rawInput || "").trim();
-      if (!q) throw new Error("Enter a valid User ID (UUID) or Email.");
+      if (!q) throw new Error("Enter a valid User ID Number, UUID, Email, Mobile or Referral Code.");
       if (UUID_RE.test(q)) return q;
-      const cleanEmail = /^\d{10}$/.test(q) ? `${q}@smartcaptcha.local` : q.toLowerCase();
-      const [u] = await sql`select id from public.users where lower(email) = ${cleanEmail} limit 1`;
-      if (!u) throw new Error("User not found for: " + q);
-      return String(u.id);
+      const [byMember] = await sql`
+        select u.id from public.users u
+        left join public.profiles p on p.id = u.id
+        where upper(coalesce(u.member_id, '')) = ${q.toUpperCase()}
+           or upper(coalesce(p.member_id, '')) = ${q.toUpperCase()}
+        limit 1
+      `;
+      if (byMember) return String(byMember.id);
+      if (/^\d{10}$/.test(q)) {
+        const [byPhone] = await sql`
+          select id from public.profiles
+          where phone = ${q} or lower(email) = ${`${q}@users.smartcaptcha.app`} or lower(email) = ${`${q}@smartcaptcha.local`}
+          limit 1
+        `;
+        if (byPhone) return String(byPhone.id);
+      }
+      const [byEmailOrRef] = await sql`
+        select u.id from public.users u
+        left join public.profiles p on p.id = u.id
+        where lower(u.email) = ${q.toLowerCase()}
+           or lower(coalesce(p.email, '')) = ${q.toLowerCase()}
+           or upper(coalesce(p.referral_code, '')) = ${q.toUpperCase()}
+        limit 1
+      `;
+      if (!byEmailOrRef) throw new Error("User not found for: " + q);
+      return String(byEmailOrRef.id);
     }
 
     if (action === "user_detail") {
+      await ensureMemberIdSchema();
       const uid = await resolveAdminTargetUid(body.user_id);
-      const [[profile], ledger, withdrawals] = await Promise.all([
+      const [
+        [profile],
+        [uSec],
+        [directRow],
+        ledger,
+        withdrawals,
+        deposits,
+        compounding_plans,
+        capState,
+        incSet,
+      ] = await Promise.all([
         sql`
-          select id, email, full_name, phone, gender, date_of_birth, city, state, pin_code,
-                 referral_code, referred_by, account_status, device_locked, is_admin, balance_usdt, created_at
-          from public.profiles where id = ${uid} limit 1
+          select p.id, p.member_id, p.email, p.full_name, p.phone, p.gender,
+                 to_char(p.date_of_birth, 'YYYY-MM-DD') as date_of_birth,
+                 p.city, p.state, p.pin_code,
+                 p.referral_code, p.referred_by,
+                 sp.full_name as sponsor_name, sp.email as sponsor_email, sp.referral_code as sponsor_referral_code,
+                 p.account_status, p.device_locked, (coalesce(p.device_token, '') <> '') as device_token_set,
+                 p.is_admin, p.balance_usdt,
+                 coalesce(p.total_captchas_solved, 0) as total_captchas_solved,
+                 coalesce(p.today_captchas_count, 0) as today_captchas_count,
+                 p.created_at
+          from public.profiles p
+          left join public.profiles sp on sp.id = p.referred_by
+          where p.id = ${uid} limit 1
         `,
+        sql`
+          select role, (coalesce(security_pin_hash, '') <> '') as pin_set,
+                 coalesce(totp_enabled, false) as totp_enabled,
+                 coalesce(token_version, 1) as token_version
+          from public.users where id = ${uid} limit 1
+        `,
+        sql`select count(*)::integer as cnt from public.profiles where referred_by = ${uid}`,
         sql`select * from public.wallet_ledger where user_id = ${uid} order by created_at desc limit 50`,
         sql`select * from public.withdrawal_requests where user_id = ${uid} order by created_at desc limit 30`,
+        sql`select * from public.deposits where user_id = ${uid} order by created_at desc limit 30`,
+        sql`select * from public.compounding_plans where user_id = ${uid} order by id desc limit 20`,
+        getUserTodayCaptchaState(uid),
+        getCachedIncomeSettings(),
       ]);
       if (!profile) return jsonRes({ error: "User profile not found." }, 404);
-      return jsonRes({ profile, wallet_balance: Number(profile?.balance_usdt || 0), ledger, withdrawals });
+      return jsonRes({
+        profile: {
+          ...profile,
+          live_today_captchas: capState?.todayPassed ?? Number(profile.today_captchas_count || 0),
+          daily_captcha_limit: Math.max(0, Number(incSet?.captcha_daily_limit ?? 50)),
+        },
+        user_security: uSec || { role: "user", pin_set: false, totp_enabled: false, token_version: 1 },
+        direct_referrals_count: Number(directRow?.cnt || 0),
+        wallet_balance: Number(profile?.balance_usdt || 0),
+        ledger,
+        withdrawals,
+        deposits,
+        compounding_plans,
+      });
     }
 
     if (action === "set_user_status") {
@@ -2380,27 +2563,180 @@ async function handleAdminControl(
       await bumpTokenVersion(target.id);
       return jsonRes({ message: `Admin access removed from ${target.email}.` });
     }
-    if (action === "update_user_profile") {
+    if (action === "reset_user_pin") {
       const uid = await resolveAdminTargetUid(body.user_id);
-      const refRaw = String(body.referral_code || "").trim().toUpperCase();
+      const newPin = String(body.new_pin || "").trim();
+      if (newPin && !/^\d{4,6}$/.test(newPin)) {
+        return jsonRes({ error: "Security PIN must be 4 to 6 digits (or leave blank to force PIN re-setup)." }, 400);
+      }
+      const pinHash = newPin ? await hashPassword(newPin) : "";
+      await sql`update public.users set security_pin_hash = ${pinHash} where id = ${uid}`;
+      await bumpTokenVersion(uid);
+      return jsonRes({ message: newPin ? "User Security PIN updated." : "Security PIN cleared. User will set a new PIN on next login." });
+    }
+    if (action === "disable_user_2fa") {
+      const uid = await resolveAdminTargetUid(body.user_id);
+      await sql`update public.users set totp_enabled = false, totp_secret = '' where id = ${uid}`;
+      return jsonRes({ message: "User Authenticator 2FA disabled." });
+    }
+    if (action === "force_logout_user") {
+      const uid = await resolveAdminTargetUid(body.user_id);
+      await bumpTokenVersion(uid);
+      return jsonRes({ message: "User logged out from all devices." });
+    }
+    if (action === "update_user_profile" || action === "update_user_a2z") {
+      const uid = await resolveAdminTargetUid(body.user_id);
+      let shouldBumpToken = false;
+
+      if (body.member_id !== undefined) {
+        const nextMid = String(body.member_id || "").trim().toUpperCase();
+        if (nextMid) {
+          if (!/^[A-Z0-9]{4,20}$/.test(nextMid)) {
+            return jsonRes({ error: "User ID must be 4–20 letters/numbers (e.g. SC054697)." }, 400);
+          }
+          const [dupMid] = await sql`
+            select u.id from public.users u
+            left join public.profiles p on p.id = u.id
+            where (upper(coalesce(u.member_id, '')) = ${nextMid} or upper(coalesce(p.member_id, '')) = ${nextMid})
+              and u.id <> ${uid}
+            limit 1
+          `;
+          if (dupMid) return jsonRes({ error: "That User ID Number is already assigned to another user." }, 409);
+          await sql`update public.users set member_id = ${nextMid} where id = ${uid}`;
+          await sql`update public.profiles set member_id = ${nextMid} where id = ${uid}`;
+        }
+      }
+
+      if (body.email !== undefined) {
+        const nextEmail = String(body.email || "").trim().toLowerCase();
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(nextEmail)) {
+          return jsonRes({ error: "Invalid email format." }, 400);
+        }
+        const [dupEmail] = await sql`select id from public.users where lower(email) = ${nextEmail} and id <> ${uid} limit 1`;
+        if (dupEmail) return jsonRes({ error: "That email is already used by another account." }, 409);
+        await sql`update public.users set email = ${nextEmail} where id = ${uid}`;
+        await sql`update public.profiles set email = ${nextEmail} where id = ${uid}`;
+      }
+
+      if (body.own_referral_code !== undefined) {
+        const ownCode = String(body.own_referral_code || "").trim().toUpperCase();
+        if (ownCode) {
+          if (!/^[A-Z0-9]{4,20}$/.test(ownCode)) {
+            return jsonRes({ error: "User referral code must be 4–20 letters/numbers (A-Z, 0-9)." }, 400);
+          }
+          const [dupRef] = await sql`select id from public.profiles where upper(referral_code) = ${ownCode} and id <> ${uid} limit 1`;
+          if (dupRef) return jsonRes({ error: "That referral code is already taken by another user." }, 409);
+          await sql`update public.profiles set referral_code = ${ownCode} where id = ${uid}`;
+        }
+      }
+
+      const refRaw = String(body.sponsor_referral_code ?? body.referral_code ?? "").trim().toUpperCase();
       if (refRaw === "NONE") {
         await sql`update public.profiles set referred_by = null where id = ${uid}`;
       } else if (refRaw) {
-        const [sp] = await sql`select id from public.profiles where referral_code = ${refRaw} and id <> ${uid} limit 1`;
+        const [sp] = await sql`select id from public.profiles where upper(referral_code) = ${refRaw} and id <> ${uid} limit 1`;
         if (!sp) return jsonRes({ error: "Sponsor referral code not found." }, 404);
         await sql`update public.profiles set referred_by = ${sp.id} where id = ${uid}`;
       }
+
+      if (body.account_status !== undefined) {
+        const st = String(body.account_status || "");
+        if (!["active", "review", "blocked", "pending"].includes(st)) {
+          return jsonRes({ error: "Invalid account status." }, 400);
+        }
+        await sql`update public.profiles set account_status = ${st} where id = ${uid}`;
+        if (st === "blocked") shouldBumpToken = true;
+      }
+
+      if (body.device_locked !== undefined) {
+        await sql`update public.profiles set device_locked = ${Boolean(body.device_locked)} where id = ${uid}`;
+      }
+      if (body.reset_device_token) {
+        await sql`update public.profiles set device_token = null where id = ${uid}`;
+      }
+
+      let dobVal: string | null = null;
+      let hasDob = false;
+      if (body.date_of_birth !== undefined) {
+        hasDob = true;
+        const dobRaw = String(body.date_of_birth || "").trim();
+        if (dobRaw) {
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(dobRaw)) {
+            return jsonRes({ error: "Date of birth must be YYYY-MM-DD." }, 400);
+          }
+          dobVal = dobRaw;
+        } else {
+          dobVal = null;
+        }
+      }
+
+      const hasFullName = body.full_name !== undefined;
+      const hasPhone = body.phone !== undefined;
+      const hasGender = body.gender !== undefined;
+      const hasState = body.state !== undefined;
+      const hasCity = body.city !== undefined;
+      const hasPinCode = body.pin_code !== undefined;
       await sql`
         update public.profiles set
-          full_name = coalesce(${body.full_name ? String(body.full_name).trim() : null}, full_name),
-          phone = coalesce(${body.phone ? String(body.phone).trim() : null}, phone),
-          gender = coalesce(${body.gender !== undefined && body.gender !== "" ? String(body.gender) : null}, gender),
-          state = coalesce(${body.state !== undefined && body.state !== "" ? String(body.state).trim() : null}, state),
-          city = coalesce(${body.city !== undefined && body.city !== "" ? String(body.city).trim() : null}, city),
-          pin_code = coalesce(${body.pin_code !== undefined && body.pin_code !== "" ? String(body.pin_code).trim() : null}, pin_code)
+          full_name = case when ${hasFullName} then ${hasFullName ? String(body.full_name).trim() : ""} else full_name end,
+          phone = case when ${hasPhone} then ${hasPhone ? String(body.phone).trim() : ""} else phone end,
+          gender = case when ${hasGender} then ${hasGender ? String(body.gender) : ""} else gender end,
+          date_of_birth = case when ${hasDob} then ${dobVal}::date else date_of_birth end,
+          state = case when ${hasState} then ${hasState ? String(body.state).trim() : ""} else state end,
+          city = case when ${hasCity} then ${hasCity ? String(body.city).trim() : ""} else city end,
+          pin_code = case when ${hasPinCode} then ${hasPinCode ? String(body.pin_code).trim() : ""} else pin_code end
         where id = ${uid}
       `;
-      return jsonRes({ message: "Profile updated." });
+
+      if (body.total_captchas_solved !== undefined && body.total_captchas_solved !== "" && Number.isFinite(Number(body.total_captchas_solved))) {
+        const totCap = Math.max(0, Math.round(Number(body.total_captchas_solved)));
+        await sql`update public.profiles set total_captchas_solved = ${totCap} where id = ${uid}`;
+      }
+
+      if (body.today_captchas_count !== undefined && body.today_captchas_count !== "" && Number.isFinite(Number(body.today_captchas_count))) {
+        const today = todayIst();
+        const cnt = Math.max(0, Math.round(Number(body.today_captchas_count)));
+        await sql`update public.profiles set today_captchas_count = ${cnt}, today_captchas_date = ${today}::date where id = ${uid}`;
+        await redis.hdel("pending:captchas", uid);
+        if (cnt === 0) {
+          await Promise.all([
+            redis.del(`cap_day:${today}:${uid}`),
+            redis.del(`cap_comp_mark:${today}:${uid}`),
+          ]);
+        } else {
+          await redis.set(`cap_day:${today}:${uid}`, String(cnt), "EX", 100_000);
+        }
+      }
+
+      if (body.new_password !== undefined && String(body.new_password) !== "") {
+        const pwd = String(body.new_password);
+        if (pwd.length < 8 || pwd.length > 128) {
+          return jsonRes({ error: "New password must be 8 to 128 characters." }, 400);
+        }
+        await sql`update public.users set password_hash = ${await hashPassword(pwd)} where id = ${uid}`;
+        shouldBumpToken = true;
+      }
+
+      if (body.new_security_pin !== undefined && String(body.new_security_pin).trim() !== "") {
+        const rawPin = String(body.new_security_pin).trim().toUpperCase();
+        if (rawPin === "RESET") {
+          await sql`update public.users set security_pin_hash = '' where id = ${uid}`;
+        } else if (!/^\d{4,6}$/.test(rawPin)) {
+          return jsonRes({ error: "Security PIN must be 4 to 6 digits (or RESET)." }, 400);
+        } else {
+          await sql`update public.users set security_pin_hash = ${await hashPassword(rawPin)} where id = ${uid}`;
+        }
+        shouldBumpToken = true;
+      }
+
+      if (body.disable_2fa) {
+        await sql`update public.users set totp_enabled = false, totp_secret = '' where id = ${uid}`;
+      }
+      if (body.force_logout || shouldBumpToken) {
+        await bumpTokenVersion(uid);
+      }
+
+      return jsonRes({ message: "All user details updated cleanly!" });
     }
     if (action === "adjust_wallet") {
       const uid = await resolveAdminTargetUid(body.user_id);
