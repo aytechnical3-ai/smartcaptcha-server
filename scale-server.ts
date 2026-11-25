@@ -456,12 +456,69 @@ async function getCachedConfigRow(cacheKey: string, queryFn: () => Promise<any[]
   return row;
 }
 
+const DEFAULT_INCOME_CONFIG = {
+  income_enabled: true,
+  captcha_daily_limit: 50,
+  captcha_reward_usdt: 0.01,
+  captcha_reward_inr: 1,
+  signup_bonus_usdt: 0,
+  signup_bonus_inr: 0,
+  fast_start_bonus_usdt: 0,
+  fast_start_bonus_inr: 0,
+  fast_start_directs: 5,
+  streak_bonus_usdt: 0,
+  streak_bonus_inr: 0,
+  streak_days: 7,
+  daily_company_cap_inr: 50000,
+  level_once_inr: [100, 50, 25, 15, 10, 5, 5, 5],
+  level_daily_inr: [10, 5, 3, 2, 2, 1, 1, 1],
+  level_daily_directs: [1, 2, 3, 4, 5, 6, 7, 8],
+};
+
+function normalizeIncomeSettings(row: Record<string, any> | null | undefined) {
+  const extra = row?.extra_config && typeof row.extra_config === "object" ? row.extra_config : {};
+  const capUsdt = Number(row?.captcha_reward_usdt ?? extra.captcha_reward_usdt ?? 0.01);
+  const signUsdt = Number(row?.signup_bonus_usdt ?? extra.signup_bonus_usdt ?? 0);
+  const fastUsdt = Number(row?.fast_start_bonus_usdt ?? extra.fast_start_bonus_usdt ?? 0);
+  const streakUsdt = Number(row?.streak_bonus_usdt ?? extra.streak_bonus_usdt ?? 0);
+  return {
+    ...DEFAULT_INCOME_CONFIG,
+    ...extra,
+    income_enabled: extra.income_enabled !== undefined ? Boolean(extra.income_enabled) : true,
+    captcha_daily_limit: Math.max(0, Number(row?.captcha_daily_limit ?? extra.captcha_daily_limit ?? 50)),
+    captcha_reward_usdt: capUsdt,
+    captcha_reward_inr: Number(extra.captcha_reward_inr ?? Math.round(capUsdt * USDT_INR_RATE * 100) / 100),
+    signup_bonus_usdt: signUsdt,
+    signup_bonus_inr: Number(extra.signup_bonus_inr ?? Math.round(signUsdt * USDT_INR_RATE * 100) / 100),
+    fast_start_bonus_usdt: fastUsdt,
+    fast_start_bonus_inr: Number(extra.fast_start_bonus_inr ?? Math.round(fastUsdt * USDT_INR_RATE * 100) / 100),
+    streak_bonus_usdt: streakUsdt,
+    streak_bonus_inr: Number(extra.streak_bonus_inr ?? Math.round(streakUsdt * USDT_INR_RATE * 100) / 100),
+  };
+}
+
+function parseCaptchaMode(raw: unknown): { random_enabled: boolean; length: number } {
+  const s = String(raw || "").trim();
+  if (s.startsWith("{")) {
+    try {
+      const p = JSON.parse(s);
+      return {
+        random_enabled: p.random_enabled !== false,
+        length: Math.min(8, Math.max(4, Math.round(Number(p.length || 5)))),
+      };
+    } catch {}
+  }
+  if (s === "off" || s === "disabled") return { random_enabled: false, length: 5 };
+  return { random_enabled: true, length: 5 };
+}
+
 async function getCachedIncomeSettings() {
-  return await getCachedConfigRow(
-    "cache:income_settings",
-    () => sql`select * from public.income_settings where id = 1`,
-    { captcha_daily_limit: 50, captcha_reward_usdt: 0.01 }
-  );
+  const cached = await redis.get("cache:income_settings");
+  if (cached) return JSON.parse(cached);
+  const rows = await sql`select * from public.income_settings where id = 1`.catch(() => []);
+  const norm = normalizeIncomeSettings(rows[0] || {});
+  await redis.set("cache:income_settings", JSON.stringify(norm), "EX", 60);
+  return norm;
 }
 
 async function getCachedCompoundingSettings() {
@@ -484,7 +541,7 @@ async function getCachedAppSettings() {
   return await getCachedConfigRow(
     "cache:app_settings",
     () => sql`select * from public.app_settings where id = 1`,
-    { registration_open: true, max_registered: 1000000, device_lock_enabled: true }
+    { registration_open: true, max_registered: 1000000, device_lock_enabled: true, captcha_mode: "standard" }
   );
 }
 
@@ -520,6 +577,9 @@ function safeIncrIfCached(cacheKey: string) {
 async function ensurePerformanceIndexes() {
   try {
     await Promise.all([
+      sql`alter table public.income_settings add column if not exists extra_config jsonb not null default '{}'::jsonb`,
+      sql`alter table public.withdrawal_requests add column if not exists tx_id text default ''`,
+      sql`alter table public.app_settings add column if not exists captcha_mode text not null default 'standard'`,
       sql`create index if not exists idx_profiles_created_at on public.profiles(created_at desc)`,
       sql`create index if not exists idx_profiles_email_lower on public.profiles(lower(email))`,
       sql`create index if not exists idx_users_email_lower on public.users(lower(email))`,
@@ -662,7 +722,16 @@ function constantTimeEqual(a: string, b: string): boolean {
 }
 
 async function issueCaptchaChallenge(userId: string, purpose = "earn") {
-  const code = randomCode(purpose === "auth" ? 5 : 6);
+  let codeLen = purpose === "auth" ? 5 : 6;
+  if (purpose === "earn") {
+    const appSet = await getCachedAppSettings();
+    const cm = parseCaptchaMode(appSet?.captcha_mode);
+    if (!cm.random_enabled) {
+      throw new Error("Captcha solving is currently paused by Admin.");
+    }
+    codeLen = cm.length;
+  }
+  const code = randomCode(codeLen);
   const token = await signCaptchaToken({
     uid: userId,
     purpose,
@@ -1184,10 +1253,51 @@ const server = Bun.serve({
 // ----------------------------------------------------------------------------
 // User Finance Handlers
 // ----------------------------------------------------------------------------
+async function getUserTodayCaptchaState(userId: string) {
+  const today = todayIst();
+  const dailyKey = `cap_day:${today}:${userId}`;
+  const [profRows, pendingRaw, redisDayRaw] = await Promise.all([
+    sql`select balance_usdt, total_captchas_solved, today_captchas_count, to_char((today_captchas_date)::date, 'YYYY-MM-DD') as db_day from public.profiles where id = ${userId} limit 1`,
+    redis.hget("pending:captchas", userId),
+    redis.get(dailyKey),
+  ]);
+  const prof = profRows[0] || { balance_usdt: 0, total_captchas_solved: 0, today_captchas_count: 0, db_day: "" };
+  const [pCnt, pUsdt] = (pendingRaw || "0:0").split(":").map(Number);
+  const dbToday = prof.db_day === today ? Number(prof.today_captchas_count || 0) : 0;
+  const redisDay = Number(redisDayRaw || 0);
+  const todayPassed = Math.max(redisDay, dbToday + (pCnt || 0));
+  if (todayPassed > 0 && redisDay < todayPassed) {
+    await redis.set(dailyKey, String(todayPassed), "EX", 100_000);
+  }
+  return { prof, pCnt: pCnt || 0, pUsdt: pUsdt || 0, todayPassed, dailyKey, dbToday };
+}
+
 async function handleUserFinance(action: string, body: Record<string, any>, user: { id: string; email?: string; role?: string }, req?: Request): Promise<Response> {
   try {
     if (action === "captcha_new") {
-      return jsonRes(await issueCaptchaChallenge(user.id));
+      const [incSet, state] = await Promise.all([
+        getCachedIncomeSettings(),
+        getUserTodayCaptchaState(user.id),
+      ]);
+      const limit = Math.max(0, Number(incSet.captcha_daily_limit ?? 50));
+      const rewardUsdt = Math.max(0, Number(incSet.captcha_reward_usdt ?? 0.01));
+      const rewardInr = Math.round(rewardUsdt * USDT_INR_RATE * 100) / 100;
+      if (limit > 0 && state.todayPassed >= limit) {
+        return jsonRes({
+          limit_reached: true,
+          today_passed: state.todayPassed,
+          captcha_daily_limit: limit,
+          reward_inr: rewardInr,
+          reward_usdt: rewardUsdt,
+        });
+      }
+      return jsonRes({
+        ...(await issueCaptchaChallenge(user.id)),
+        today_passed: state.todayPassed,
+        captcha_daily_limit: limit,
+        reward_inr: rewardInr,
+        reward_usdt: rewardUsdt,
+      });
     }
 
     if (action === "captcha_submit") {
@@ -1199,46 +1309,89 @@ async function handleUserFinance(action: string, body: Record<string, any>, user
       const setOk = await redis.set(`cap_used:${verified.nid}`, "1", "EX", 240, "NX");
       if (!setOk) return jsonRes({ error: "Captcha already submitted." }, 400);
 
-      const next = await issueCaptchaChallenge(user.id);
-      if (String(body.answer || "").trim().toUpperCase() !== String(verified.code).toUpperCase()) {
-        return jsonRes({ ok: false, next });
+      const [incSet, state] = await Promise.all([
+        getCachedIncomeSettings(),
+        getUserTodayCaptchaState(user.id),
+      ]);
+      const limit = Math.max(0, Number(incSet.captcha_daily_limit ?? 50));
+      const rewardUsdt = Math.max(0, Number(incSet.captcha_reward_usdt ?? 0.01));
+      const rewardInr = Math.round(rewardUsdt * USDT_INR_RATE * 100) / 100;
+
+      if (state.todayPassed >= limit) {
+        return jsonRes({
+          ok: true,
+          reward_paid: false,
+          limit_reached: true,
+          today_passed: state.todayPassed,
+          captcha_daily_limit: limit,
+          reward_inr: rewardInr,
+          next: null,
+        });
       }
 
-      const incSet = await getCachedIncomeSettings();
-      const limit = Number(incSet.captcha_daily_limit || 50);
-      const rewardUsdt = Number(incSet.captcha_reward_usdt || 0.01);
-      const dailyKey = `cap_day:${todayIst()}:${user.id}`;
-      const newCount = await redis.incr(dailyKey);
-      if (newCount === 1) await redis.expire(dailyKey, 100_000);
+      if (String(body.answer || "").trim().toUpperCase() !== String(verified.code).toUpperCase()) {
+        const next = await issueCaptchaChallenge(user.id);
+        return jsonRes({ ok: false, today_passed: state.todayPassed, captcha_daily_limit: limit, next });
+      }
 
-      const rewardPaid = newCount <= limit;
+      const incrVal = await redis.incr(state.dailyKey);
+      const newCount = Math.max(state.todayPassed + 1, incrVal);
+      if (newCount !== incrVal || newCount === 1) {
+        await redis.set(state.dailyKey, String(newCount), "EX", 100_000);
+      }
+
+      const incomeEnabled = incSet.income_enabled !== false;
+      const rewardPaid = incomeEnabled && newCount <= limit && rewardUsdt > 0;
       if (rewardPaid) {
         await redis.eval(LUA_ADD_PENDING, 1, "pending:captchas", user.id, "1", String(rewardUsdt));
       }
-      return jsonRes({ ok: true, reward_paid: rewardPaid, today_passed: newCount, captcha_daily_limit: limit, next });
+      const limitReached = newCount >= limit;
+      const next = limitReached ? null : await issueCaptchaChallenge(user.id);
+      return jsonRes({
+        ok: true,
+        reward_paid: rewardPaid,
+        limit_reached: limitReached,
+        today_passed: newCount,
+        captcha_daily_limit: limit,
+        reward_inr: rewardInr,
+        reward_usdt: rewardUsdt,
+        next,
+      });
     }
 
     if (action === "wallet") {
-      const [profRows, pendingRaw, deposits, withdrawals, incSet] = await Promise.all([
-        sql`select balance_usdt, total_captchas_solved, today_captchas_count, today_captchas_date from public.profiles where id = ${user.id} limit 1`,
-        redis.hget("pending:captchas", user.id),
+      const [capState, deposits, withdrawals, incSet, ledgerSums] = await Promise.all([
+        getUserTodayCaptchaState(user.id),
         sql`select * from public.deposits where user_id = ${user.id} order by created_at desc limit 20`,
         sql`select * from public.withdrawal_requests where user_id = ${user.id} order by created_at desc limit 20`,
         getCachedIncomeSettings(),
+        sql`select entry_type, coalesce(sum(amount), 0) as total_usdt from public.wallet_ledger where user_id = ${user.id} group by entry_type`,
       ]);
-      const prof = profRows[0] || { balance_usdt: 0, total_captchas_solved: 0, today_captchas_count: 0 };
-      const [pCnt, pUsdt] = (pendingRaw || "0:0").split(":").map(Number);
-      const totalUsdt = Number(prof.balance_usdt || 0) + (pUsdt || 0);
-      const today = todayIst();
-      const dbToday = String(prof.today_captchas_date || "").slice(0, 10) === today ? Number(prof.today_captchas_count || 0) : 0;
+      const { prof, pCnt, pUsdt, todayPassed } = capState;
+      const totalUsdt = Number(prof.balance_usdt || 0) + pUsdt;
       const depUsdt = deposits.filter((d: any) => d.status === "approved").reduce((s: number, d: any) => s + Number(d.amount_usdt || 0), 0);
+      const rewardUsdt = Number(incSet.captcha_reward_usdt ?? 0.01);
+      const rewardInr = Number(incSet.captcha_reward_inr ?? Math.round(rewardUsdt * USDT_INR_RATE * 100) / 100);
+      const limit = Number(incSet.captcha_daily_limit ?? 50);
+
+      const incomeByType: Record<string, number> = {};
+      for (const r of ledgerSums) {
+        incomeByType[String(r.entry_type)] = Math.round(Number(r.total_usdt || 0) * USDT_INR_RATE * 100) / 100;
+      }
+      if (pUsdt > 0) {
+        incomeByType.captcha_income = Math.round(((incomeByType.captcha_income || 0) + pUsdt * USDT_INR_RATE) * 100) / 100;
+      }
+
       return jsonRes({
         balance_usdt: Math.round(totalUsdt * 10000) / 10000,
         balance_inr: Math.round(totalUsdt * USDT_INR_RATE * 100) / 100,
-        tasks_completed: Number(prof.total_captchas_solved || 0) + (pCnt || 0),
-        today_passed: dbToday + (pCnt || 0),
-        captcha_daily_limit: Number(incSet.captcha_daily_limit || 50),
-        today_income_inr: Math.round((dbToday + (pCnt || 0)) * Number(incSet.captcha_reward_usdt || 0.01) * USDT_INR_RATE * 100) / 100,
+        tasks_completed: Number(prof.total_captchas_solved || 0) + pCnt,
+        today_passed: todayPassed,
+        captcha_daily_limit: limit,
+        captcha_reward_usdt: rewardUsdt,
+        captcha_reward_inr: rewardInr,
+        income_by_type: incomeByType,
+        today_income_inr: Math.round(todayPassed * rewardUsdt * USDT_INR_RATE * 100) / 100,
         total_income_inr: Math.round(totalUsdt * USDT_INR_RATE * 100) / 100,
         deposited_usdt: Math.round(depUsdt * 100) / 100,
         available_deposit_usdt: Math.round(depUsdt * 100) / 100,
@@ -1298,6 +1451,31 @@ async function handleUserFinance(action: string, body: Record<string, any>, user
       const addr = String(body.wallet_address || "").trim();
       if (!Number.isFinite(amt) || amt <= 0) return jsonRes({ error: "Invalid withdrawal amount." }, 400);
       if (!/^0x[a-fA-F0-9]{40}$/.test(addr)) return jsonRes({ error: "Invalid BEP-20 wallet address." }, 400);
+      if (!(await verifyTurnstile(body.captchaToken))) {
+        return jsonRes({ error: "Cloudflare human verification failed. Please verify again." }, 400);
+      }
+
+      const [wdCfg, [pSet], depRows, todayWdRows] = await Promise.all([
+        getCachedWithdrawConfig(),
+        sql`select withdraw_rule_json from public.platform_settings where id = 1`,
+        sql`select coalesce(sum(amount_usdt), 0) as total from public.deposits where user_id = ${user.id} and status = 'approved'`,
+        sql`select count(*)::integer as cnt from public.withdrawal_requests where user_id = ${user.id} and (created_at at time zone 'Asia/Kolkata')::date = (now() at time zone 'Asia/Kolkata')::date`,
+      ]);
+      const depUsdt = Number(depRows[0]?.total || 0);
+      const rule = pSet?.withdraw_rule_json || {};
+      if (rule.enabled && depUsdt < Number(rule.min_deposit_usdt || 0)) {
+        return jsonRes({ error: `Minimum ${Number(rule.min_deposit_usdt)} USDT approved deposit required before withdrawal.` }, 400);
+      }
+      const chart = wdCfg?.chart && !Array.isArray(wdCfg.chart) ? wdCfg.chart : {};
+      const dailyLimit = Number(chart.daily_limit ?? 2);
+      if (dailyLimit > 0 && Number(todayWdRows[0]?.cnt || 0) >= dailyLimit) {
+        return jsonRes({ error: `Daily withdrawal limit reached (${dailyLimit}/day).` }, 400);
+      }
+      const reqPct = Number(chart.deposit_percent ?? 40);
+      const reqDep = Math.round(amt * (reqPct / 100) * 100) / 100;
+      if (reqDep > 0 && depUsdt < reqDep) {
+        return jsonRes({ error: `Deposit ${reqDep.toFixed(2)} USDT (${reqPct}%) required to withdraw ${amt} USDT.` }, 400);
+      }
 
       await sql.begin(async (tx: any) => {
         const [prof] = await tx`select balance_usdt from public.profiles where id = ${user.id} for update`;
@@ -1307,8 +1485,8 @@ async function handleUserFinance(action: string, body: Record<string, any>, user
           values (${user.id}, 'withdrawal_reserve', ${-amt}, ${`Withdrawal request to ${addr}`})
         `;
         await tx`
-          insert into public.withdrawal_requests (user_id, amount, payout_method, payout_details_masked, payout_address, status)
-          values (${user.id}, ${amt}, 'USDT BEP-20', ${addr.slice(0, 6) + "..." + addr.slice(-4)}, ${addr}, 'pending')
+          insert into public.withdrawal_requests (user_id, amount, payout_method, payout_details_masked, payout_address, required_deposit_usdt, status)
+          values (${user.id}, ${amt}, 'USDT BEP-20', ${addr.slice(0, 6) + "..." + addr.slice(-4)}, ${addr}, ${reqDep}, 'pending')
         `;
       });
       return jsonRes({ message: "Withdrawal request submitted." });
@@ -1527,35 +1705,50 @@ async function handleAdminControl(
       return jsonRes({ users });
     }
 
+    async function resolveAdminTargetUid(rawInput: unknown): Promise<string> {
+      const q = String(rawInput || "").trim();
+      if (!q) throw new Error("Enter a valid User ID (UUID) or Email.");
+      if (UUID_RE.test(q)) return q;
+      const cleanEmail = /^\d{10}$/.test(q) ? `${q}@smartcaptcha.local` : q.toLowerCase();
+      const [u] = await sql`select id from public.users where lower(email) = ${cleanEmail} limit 1`;
+      if (!u) throw new Error("User not found for: " + q);
+      return String(u.id);
+    }
+
     if (action === "user_detail") {
-      const uid = String(body.user_id || "");
-      const [[profile], ledger] = await Promise.all([
+      const uid = await resolveAdminTargetUid(body.user_id);
+      const [[profile], ledger, withdrawals] = await Promise.all([
         sql`
           select id, email, full_name, phone, gender, date_of_birth, city, state, pin_code,
                  referral_code, referred_by, account_status, device_locked, is_admin, balance_usdt, created_at
           from public.profiles where id = ${uid} limit 1
         `,
         sql`select * from public.wallet_ledger where user_id = ${uid} order by created_at desc limit 50`,
+        sql`select * from public.withdrawal_requests where user_id = ${uid} order by created_at desc limit 30`,
       ]);
-      return jsonRes({ profile, wallet_balance: Number(profile?.balance_usdt || 0), ledger });
+      if (!profile) return jsonRes({ error: "User profile not found." }, 404);
+      return jsonRes({ profile, wallet_balance: Number(profile?.balance_usdt || 0), ledger, withdrawals });
     }
 
     if (action === "set_user_status") {
+      const uid = await resolveAdminTargetUid(body.user_id);
       const st = String(body.status || "");
       if (!["active", "review", "blocked", "pending"].includes(st)) return jsonRes({ error: "Invalid account status." }, 400);
-      await sql`update public.profiles set account_status = ${st} where id = ${String(body.user_id)}`;
-      if (st === "blocked") await bumpTokenVersion(String(body.user_id));
+      await sql`update public.profiles set account_status = ${st} where id = ${uid}`;
+      if (st === "blocked") await bumpTokenVersion(uid);
       return jsonRes({ message: "User status updated." });
     }
     if (action === "reset_device_lock") {
-      await sql`update public.profiles set device_token = null where id = ${String(body.user_id)}`;
+      const uid = await resolveAdminTargetUid(body.user_id);
+      await sql`update public.profiles set device_token = null where id = ${uid}`;
       return jsonRes({ message: "Device lock reset." });
     }
     if (action === "reset_user_password") {
+      const uid = await resolveAdminTargetUid(body.user_id);
       const pwd = String(body.password || "");
       if (pwd.length < 8 || pwd.length > 128) return jsonRes({ error: "Password must be 8 to 128 characters." }, 400);
-      await sql`update public.users set password_hash = ${await hashPassword(pwd)} where id = ${String(body.user_id)}`;
-      await bumpTokenVersion(String(body.user_id));
+      await sql`update public.users set password_hash = ${await hashPassword(pwd)} where id = ${uid}`;
+      await bumpTokenVersion(uid);
       return jsonRes({ message: "User password reset." });
     }
     if (action === "change_admin_password") {
@@ -1704,14 +1897,29 @@ async function handleAdminControl(
       return jsonRes({ message: `Admin access removed from ${target.email}.` });
     }
     if (action === "update_user_profile") {
+      const uid = await resolveAdminTargetUid(body.user_id);
+      const refRaw = String(body.referral_code || "").trim().toUpperCase();
+      if (refRaw === "NONE") {
+        await sql`update public.profiles set referred_by = null where id = ${uid}`;
+      } else if (refRaw) {
+        const [sp] = await sql`select id from public.profiles where referral_code = ${refRaw} and id <> ${uid} limit 1`;
+        if (!sp) return jsonRes({ error: "Sponsor referral code not found." }, 404);
+        await sql`update public.profiles set referred_by = ${sp.id} where id = ${uid}`;
+      }
       await sql`
-        update public.profiles set full_name = coalesce(${body.full_name || null}, full_name), phone = coalesce(${body.phone || null}, phone)
-        where id = ${String(body.user_id)}
+        update public.profiles set
+          full_name = coalesce(${body.full_name ? String(body.full_name).trim() : null}, full_name),
+          phone = coalesce(${body.phone ? String(body.phone).trim() : null}, phone),
+          gender = coalesce(${body.gender !== undefined && body.gender !== "" ? String(body.gender) : null}, gender),
+          state = coalesce(${body.state !== undefined && body.state !== "" ? String(body.state).trim() : null}, state),
+          city = coalesce(${body.city !== undefined && body.city !== "" ? String(body.city).trim() : null}, city),
+          pin_code = coalesce(${body.pin_code !== undefined && body.pin_code !== "" ? String(body.pin_code).trim() : null}, pin_code)
+        where id = ${uid}
       `;
       return jsonRes({ message: "Profile updated." });
     }
     if (action === "adjust_wallet") {
-      const uid = String(body.user_id);
+      const uid = await resolveAdminTargetUid(body.user_id);
       const amt = Number(body.amount);
       if (!Number.isFinite(amt) || amt === 0) return jsonRes({ error: "Invalid adjustment amount." }, 400);
       await sql`
@@ -1736,11 +1944,12 @@ async function handleAdminControl(
       const wid = Number(body.withdrawal_id);
       const dec = String(body.decision || "");
       const note = String(body.note || "");
+      const txId = String(body.tx_id || "").trim();
       if (!["approved", "rejected"].includes(dec)) return jsonRes({ error: "Invalid decision." }, 400);
       const settled = await sql.begin(async (tx: any) => {
         const [w] = await tx`
           update public.withdrawal_requests
-          set status = ${dec}, admin_note = ${note}, settled_at = now()
+          set status = ${dec}, admin_note = ${note}, tx_id = ${txId || null}, settled_at = now()
           where id = ${wid} and status = 'pending'
           returning *
         `;
@@ -1759,10 +1968,19 @@ async function handleAdminControl(
 
     if (action === "list_deposits") {
       const st = String(body.status || "all");
-      const deposits = st === "all"
-        ? await sql`select * from public.deposits order by id desc limit 100`
-        : await sql`select * from public.deposits where status = ${st} order by id desc limit 100`;
-      return jsonRes({ deposits });
+      const uid = String(body.user_id || "").trim();
+      const deposits = await sql`
+        select * from public.deposits
+        where (${st === "all"} or status = ${st})
+          and (${!UUID_RE.test(uid)} or user_id = ${UUID_RE.test(uid) ? uid : "00000000-0000-0000-0000-000000000000"}::uuid)
+        order by id desc limit 100
+      `;
+      return jsonRes({
+        deposits: deposits.map((d: any) => ({
+          ...d,
+          amount_inr: Math.round(Number(d.amount_usdt || 0) * USDT_INR_RATE * 100) / 100,
+        })),
+      });
     }
     if (action === "settle_deposit") {
       const did = Number(body.deposit_id);
@@ -1810,74 +2028,203 @@ async function handleAdminControl(
     }
     if (action === "get_captcha_mode") {
       const s = await getCachedAppSettings();
-      return jsonRes({ mode: s?.captcha_mode || "standard" });
+      const cm = parseCaptchaMode(s?.captcha_mode);
+      return jsonRes({ random_enabled: cm.random_enabled, length: cm.length, mode: cm.random_enabled ? "standard" : "off" });
     }
     if (action === "set_captcha_mode") {
-      await sql`update public.app_settings set captcha_mode = ${String(body.mode || "standard")} where id = 1`;
+      const randomEnabled = body.random_enabled !== undefined ? Boolean(body.random_enabled) : String(body.mode || "standard") !== "off";
+      const len = Math.min(8, Math.max(4, Math.round(Number(body.length || 5))));
+      const val = JSON.stringify({ random_enabled: randomEnabled, length: len });
+      await sql`
+        insert into public.app_settings (id, captcha_mode, updated_at)
+        values (1, ${val}, now())
+        on conflict (id) do update set captcha_mode = excluded.captcha_mode, updated_at = now()
+      `;
       await redis.del("cache:app_settings");
-      return jsonRes({ message: "Captcha mode updated." });
+      return jsonRes({ message: `Captcha updated (${randomEnabled ? "ON" : "OFF"}, ${len} chars).`, random_enabled: randomEnabled, length: len });
     }
 
     if (action === "get_deposit_address") {
       const [c] = await sql`select deposit_address, deposit_qr from public.public_withdraw_config where id = 1`;
-      return jsonRes(c || { deposit_address: "", deposit_qr: "" });
+      const addr = c?.deposit_address || "";
+      const qr = c?.deposit_qr || "";
+      return jsonRes({ address: addr, qr, deposit_address: addr, deposit_qr: qr });
     }
     if (action === "set_deposit_address") {
-      await sql`update public.public_withdraw_config set deposit_address = ${String(body.deposit_address || "")}, deposit_qr = ${String(body.deposit_qr || "")} where id = 1`;
+      const addr = String(body.address ?? body.deposit_address ?? "").trim();
+      const hasQr = body.qr !== undefined || body.deposit_qr !== undefined;
+      const qr = String(body.qr ?? body.deposit_qr ?? "");
+      if (hasQr) {
+        await sql`
+          insert into public.public_withdraw_config (id, deposit_address, deposit_qr, updated_at)
+          values (1, ${addr}, ${qr}, now())
+          on conflict (id) do update set deposit_address = excluded.deposit_address, deposit_qr = excluded.deposit_qr, updated_at = now()
+        `;
+      } else {
+        await sql`
+          insert into public.public_withdraw_config (id, deposit_address, updated_at)
+          values (1, ${addr}, now())
+          on conflict (id) do update set deposit_address = excluded.deposit_address, updated_at = now()
+        `;
+      }
       await redis.del("cache:public_withdraw_config");
       return jsonRes({ message: "Deposit address updated." });
     }
     if (action === "set_withdrawal_amounts") {
-      await sql`update public.public_withdraw_config set amounts = ${JSON.stringify(body.amounts || [])}::jsonb where id = 1`;
+      await sql`update public.public_withdraw_config set amounts = ${JSON.stringify(body.amounts || [])}::jsonb, updated_at = now() where id = 1`;
       await redis.del("cache:public_withdraw_config");
       return jsonRes({ message: "Withdrawal amounts saved." });
     }
     if (action === "set_amount_conditions") {
-      await sql`update public.public_withdraw_config set amount_conditions = ${JSON.stringify(body.amount_conditions || [])}::jsonb where id = 1`;
+      const conds = body.conditions ?? body.amount_conditions ?? [];
+      await sql`update public.public_withdraw_config set amount_conditions = ${JSON.stringify(conds)}::jsonb, updated_at = now() where id = 1`;
       await redis.del("cache:public_withdraw_config");
       return jsonRes({ message: "Amount conditions saved." });
     }
     if (action === "get_withdraw_chart") {
       const [c] = await sql`select chart from public.public_withdraw_config where id = 1`;
-      return jsonRes({ chart: c?.chart || [] });
+      return jsonRes({ chart: c?.chart || {} });
     }
     if (action === "set_withdraw_chart") {
-      await sql`update public.public_withdraw_config set chart = ${JSON.stringify(body.chart || [])}::jsonb where id = 1`;
+      const chart = body.chart || {
+        deposit_percent: Number(body.deposit_percent ?? 40),
+        net_percent: Number(body.net_percent ?? 60),
+        daily_limit: Number(body.daily_limit ?? 2),
+        processing: String(body.processing || "1 - 12 Hours (Estimated)"),
+      };
+      await sql`update public.public_withdraw_config set chart = ${JSON.stringify(chart)}::jsonb, updated_at = now() where id = 1`;
       await redis.del("cache:public_withdraw_config");
       return jsonRes({ message: "Withdraw chart updated." });
     }
     if (action === "get_withdraw_rule") {
       const [p] = await sql`select withdraw_rule_json from public.platform_settings where id = 1`;
-      return jsonRes({ rule: p?.withdraw_rule_json || {} });
+      const r = p?.withdraw_rule_json || {};
+      return jsonRes({ enabled: Boolean(r.enabled), min_deposit_usdt: Number(r.min_deposit_usdt || 0), rule: r });
     }
     if (action === "set_withdraw_rule") {
-      await sql`update public.platform_settings set withdraw_rule_json = ${JSON.stringify(body.rule || body)}::jsonb where id = 1`;
+      const r = body.rule || { enabled: Boolean(body.enabled), min_deposit_usdt: Number(body.min_deposit_usdt || 0) };
+      await sql`
+        insert into public.platform_settings (id, withdraw_rule_json, updated_at)
+        values (1, ${JSON.stringify(r)}::jsonb, now())
+        on conflict (id) do update set withdraw_rule_json = excluded.withdraw_rule_json, updated_at = now()
+      `;
       return jsonRes({ message: "Withdrawal rules updated." });
     }
 
     if (action === "get_income_settings") {
-      const [s] = await sql`select * from public.income_settings where id = 1`;
-      return jsonRes({ settings: s });
+      const [[row], [spentRow], pendingRows] = await Promise.all([
+        sql`select * from public.income_settings where id = 1`,
+        sql`
+          select coalesce(sum(amount), 0) as total_usdt
+          from public.wallet_ledger
+          where amount > 0
+            and entry_type in ('captcha_income','signup_bonus','fast_start_bonus','streak_bonus','level_once','level_daily')
+            and (created_at at time zone 'Asia/Kolkata')::date = (now() at time zone 'Asia/Kolkata')::date
+        `,
+        redis.hvals("pending:captchas").catch(() => []),
+      ]);
+      const pendingUsdt = (pendingRows || []).reduce((acc: number, v: string) => acc + Number((v || "0:0").split(":")[1] || 0), 0);
+      const spentTodayInr = Math.round((Number(spentRow?.total_usdt || 0) + pendingUsdt) * USDT_INR_RATE * 100) / 100;
+      const settings = normalizeIncomeSettings(row || {});
+      return jsonRes({ settings, spent_today_inr: spentTodayInr });
     }
     if (action === "set_income_settings") {
+      const [curRow] = await sql`select * from public.income_settings where id = 1`;
+      const cur = normalizeIncomeSettings(curRow || {});
+      const rawLimit = Number(body.captcha_daily_limit);
+      const limit = body.captcha_daily_limit !== undefined && Number.isFinite(rawLimit)
+        ? Math.max(0, Math.round(rawLimit))
+        : cur.captcha_daily_limit;
+      const rawCapInr = Number(body.captcha_reward_inr);
+      const capUsdt = body.captcha_reward_inr !== undefined && Number.isFinite(rawCapInr)
+        ? Math.max(0, Math.round((rawCapInr / USDT_INR_RATE) * 10000) / 10000)
+        : (body.captcha_reward_usdt !== undefined && Number.isFinite(Number(body.captcha_reward_usdt)) ? Math.max(0, Number(body.captcha_reward_usdt)) : cur.captcha_reward_usdt);
+      const rawSignInr = Number(body.signup_bonus_inr);
+      const signUsdt = body.signup_bonus_inr !== undefined && Number.isFinite(rawSignInr)
+        ? Math.max(0, Math.round((rawSignInr / USDT_INR_RATE) * 10000) / 10000)
+        : (body.signup_bonus_usdt !== undefined && Number.isFinite(Number(body.signup_bonus_usdt)) ? Math.max(0, Number(body.signup_bonus_usdt)) : cur.signup_bonus_usdt);
+      const rawFastInr = Number(body.fast_start_bonus_inr);
+      const fastUsdt = body.fast_start_bonus_inr !== undefined && Number.isFinite(rawFastInr)
+        ? Math.max(0, Math.round((rawFastInr / USDT_INR_RATE) * 10000) / 10000)
+        : (body.fast_start_bonus_usdt !== undefined && Number.isFinite(Number(body.fast_start_bonus_usdt)) ? Math.max(0, Number(body.fast_start_bonus_usdt)) : cur.fast_start_bonus_usdt);
+      const rawStreakInr = Number(body.streak_bonus_inr);
+      const streakUsdt = body.streak_bonus_inr !== undefined && Number.isFinite(rawStreakInr)
+        ? Math.max(0, Math.round((rawStreakInr / USDT_INR_RATE) * 10000) / 10000)
+        : (body.streak_bonus_usdt !== undefined && Number.isFinite(Number(body.streak_bonus_usdt)) ? Math.max(0, Number(body.streak_bonus_usdt)) : cur.streak_bonus_usdt);
+
+      const extra = {
+        income_enabled: body.income_enabled !== undefined ? Boolean(body.income_enabled) : cur.income_enabled,
+        captcha_daily_limit: limit,
+        captcha_reward_usdt: capUsdt,
+        captcha_reward_inr: body.captcha_reward_inr !== undefined && Number.isFinite(rawCapInr) ? Math.max(0, rawCapInr) : Math.round(capUsdt * USDT_INR_RATE * 100) / 100,
+        signup_bonus_usdt: signUsdt,
+        signup_bonus_inr: body.signup_bonus_inr !== undefined && Number.isFinite(rawSignInr) ? Math.max(0, rawSignInr) : Math.round(signUsdt * USDT_INR_RATE * 100) / 100,
+        fast_start_bonus_usdt: fastUsdt,
+        fast_start_bonus_inr: body.fast_start_bonus_inr !== undefined && Number.isFinite(rawFastInr) ? Math.max(0, rawFastInr) : Math.round(fastUsdt * USDT_INR_RATE * 100) / 100,
+        fast_start_directs: body.fast_start_directs !== undefined && Number.isFinite(Number(body.fast_start_directs)) ? Math.max(1, Number(body.fast_start_directs)) : cur.fast_start_directs,
+        streak_bonus_usdt: streakUsdt,
+        streak_bonus_inr: body.streak_bonus_inr !== undefined && Number.isFinite(rawStreakInr) ? Math.max(0, rawStreakInr) : Math.round(streakUsdt * USDT_INR_RATE * 100) / 100,
+        streak_days: body.streak_days !== undefined && Number.isFinite(Number(body.streak_days)) ? Math.max(1, Number(body.streak_days)) : cur.streak_days,
+        daily_company_cap_inr: body.daily_company_cap_inr !== undefined && Number.isFinite(Number(body.daily_company_cap_inr)) ? Math.max(0, Number(body.daily_company_cap_inr)) : cur.daily_company_cap_inr,
+        level_once_inr: Array.isArray(body.level_once_inr) ? body.level_once_inr.map((n: any) => Math.max(0, Number(n) || 0)) : cur.level_once_inr,
+        level_daily_inr: Array.isArray(body.level_daily_inr) ? body.level_daily_inr.map((n: any) => Math.max(0, Number(n) || 0)) : cur.level_daily_inr,
+        level_daily_directs: Array.isArray(body.level_daily_directs) ? body.level_daily_directs.map((n: any) => Math.max(0, Number(n) || 0)) : cur.level_daily_directs,
+      };
       await sql`
-        update public.income_settings set
-          captcha_daily_limit = coalesce(${body.captcha_daily_limit ?? null}, captcha_daily_limit),
-          captcha_reward_usdt = coalesce(${body.captcha_reward_usdt ?? null}, captcha_reward_usdt),
-          signup_bonus_usdt = coalesce(${body.signup_bonus_usdt ?? null}, signup_bonus_usdt),
-          fast_start_bonus_usdt = coalesce(${body.fast_start_bonus_usdt ?? null}, fast_start_bonus_usdt),
-          streak_bonus_usdt = coalesce(${body.streak_bonus_usdt ?? null}, streak_bonus_usdt)
-        where id = 1
+        insert into public.income_settings (
+          id, captcha_daily_limit, captcha_reward_usdt, signup_bonus_usdt,
+          fast_start_bonus_usdt, streak_bonus_usdt, extra_config, updated_at
+        ) values (
+          1, ${limit}, ${capUsdt}, ${signUsdt}, ${fastUsdt}, ${streakUsdt}, ${JSON.stringify(extra)}::jsonb, now()
+        )
+        on conflict (id) do update set
+          captcha_daily_limit = excluded.captcha_daily_limit,
+          captcha_reward_usdt = excluded.captcha_reward_usdt,
+          signup_bonus_usdt = excluded.signup_bonus_usdt,
+          fast_start_bonus_usdt = excluded.fast_start_bonus_usdt,
+          streak_bonus_usdt = excluded.streak_bonus_usdt,
+          extra_config = excluded.extra_config,
+          updated_at = now()
       `;
       await redis.del("cache:income_settings");
-      return jsonRes({ message: "Income settings saved." });
+      return jsonRes({ message: `Income settings saved! Daily Captcha Limit: ${limit}, Reward: ₹${extra.captcha_reward_inr}`, settings: extra });
     }
     if (action === "income_summary") {
-      const [s] = await sql`select coalesce(sum(case when amount > 0 then amount else 0 end), 0) as total_in, count(*)::integer as entries from public.wallet_ledger`;
-      return jsonRes(s);
+      const [[tot], [wal], byType] = await Promise.all([
+        sql`
+          select coalesce(sum(case when amount > 0 then amount else 0 end), 0) as total_credited,
+                 coalesce(sum(case when amount < 0 then abs(amount) else 0 end), 0) as total_debited
+          from public.wallet_ledger
+        `,
+        sql`select coalesce(sum(balance_usdt), 0) as user_wallets_total from public.profiles`,
+        sql`
+          select entry_type as type, count(*)::integer as count, coalesce(sum(amount), 0) as total
+          from public.wallet_ledger
+          group by entry_type order by count desc
+        `,
+      ]);
+      return jsonRes({
+        summary: {
+          total_credited: Number(tot?.total_credited || 0),
+          total_debited: Number(tot?.total_debited || 0),
+          user_wallets_total: Number(wal?.user_wallets_total || 0),
+          by_type: byType,
+        },
+      });
     }
     if (action === "list_ledger") {
-      const entries = await sql`select * from public.wallet_ledger order by id desc limit ${Math.min(200, Number(body.limit) || 50)}`;
+      const q = String(body.query || "").trim();
+      const t = String(body.type || "all").trim();
+      const lim = Math.min(200, Math.max(10, Number(body.limit) || 50));
+      const off = Math.max(0, Number(body.offset) || 0);
+      const entries = await sql`
+        select w.*, coalesce(p.full_name, '') as full_name, coalesce(p.email, '') as email
+        from public.wallet_ledger w
+        left join public.profiles p on p.id = w.user_id
+        where (${t === "all" || !t} or w.entry_type = ${t})
+          and (${!q} or coalesce(p.email, '') ilike ${"%" + q + "%"} or coalesce(p.full_name, '') ilike ${"%" + q + "%"} or coalesce(w.description, '') ilike ${"%" + q + "%"})
+        order by w.id desc limit ${lim} offset ${off}
+      `;
       return jsonRes({ entries });
     }
     if (action === "run_daily_income") {
@@ -1957,7 +2304,14 @@ async function handleAdminControl(
     }
 
     if (action === "list_tickets") {
-      const tickets = await sql`select * from public.support_tickets order by updated_at desc limit 100`;
+      const st = String(body.status || "all");
+      const tickets = await sql`
+        select t.*, coalesce(p.email, '') as email
+        from public.support_tickets t
+        left join public.profiles p on p.id = t.user_id
+        where (${st === "all" || !st} or t.status = ${st})
+        order by t.updated_at desc limit 100
+      `;
       return jsonRes({ tickets });
     }
     if (action === "ticket_messages") {
@@ -1966,15 +2320,38 @@ async function handleAdminControl(
     }
     if (action === "reply_ticket") {
       const tid = Number(body.ticket_id);
-      await sql`insert into public.ticket_messages (ticket_id, sender, body) values (${tid}, 'admin', ${String(body.message || "").trim()})`;
-      await sql`update public.support_tickets set status = 'answered', updated_at = now() where id = ${tid}`;
-      return jsonRes({ message: "Reply sent." });
+      const msgBody = String(body.message || "").trim();
+      if (msgBody) {
+        await sql`insert into public.ticket_messages (ticket_id, sender, body) values (${tid}, 'admin', ${msgBody})`;
+      }
+      const nextSt = body.close ? "closed" : "answered";
+      await sql`update public.support_tickets set status = ${nextSt}, updated_at = now() where id = ${tid}`;
+      return jsonRes({ message: body.close ? "Ticket closed." : "Reply sent." });
     }
 
     // Compounding Admin Actions
     if (action === "get_compounding_settings") {
-      const [s] = await sql`select * from public.compounding_settings where id = 1`;
-      return jsonRes({ settings: s });
+      const [[s], [st], [spentRow]] = await Promise.all([
+        sql`select * from public.compounding_settings where id = 1`,
+        sql`
+          select count(*)::integer as total_plans,
+                 count(*) filter (where status='active')::integer as active_plans,
+                 coalesce(sum(principal_inr), 0) as total_invested_inr,
+                 coalesce(sum(total_profit_inr), 0) as total_profit_inr
+          from public.compounding_plans
+        `,
+        sql`select coalesce(sum(profit_inr), 0) as spent_today_inr from public.compounding_daily_logs where credit_date = (now() at time zone 'Asia/Kolkata')::date`,
+      ]);
+      return jsonRes({
+        settings: s,
+        stats: {
+          total_plans: Number(st?.total_plans || 0),
+          active_plans: Number(st?.active_plans || 0),
+          total_invested_inr: Number(st?.total_invested_inr || 0),
+          total_profit_inr: Number(st?.total_profit_inr || 0),
+          spent_today_inr: Number(spentRow?.spent_today_inr || 0),
+        },
+      });
     }
     if (action === "set_compounding_settings") {
       await sql`
@@ -2001,9 +2378,15 @@ async function handleAdminControl(
     }
     if (action === "list_compounding_plans") {
       const st = String(body.status || "all");
-      const plans = st === "all"
-        ? await sql`select * from public.compounding_plans order by id desc limit 100`
-        : await sql`select * from public.compounding_plans where status = ${st} order by id desc limit 100`;
+      const q = String(body.query || "").trim();
+      const plans = await sql`
+        select cp.*, coalesce(p.full_name, '-') as user_name, coalesce(p.email, '') as user_email
+        from public.compounding_plans cp
+        left join public.profiles p on p.id = cp.user_id
+        where (${st === "all" || !st} or cp.status = ${st})
+          and (${!q} or coalesce(p.email, '') ilike ${"%" + q + "%"} or coalesce(p.full_name, '') ilike ${"%" + q + "%"})
+        order by cp.id desc limit 100
+      `;
       const [stats] = await sql`
         select count(*) filter (where status='active')::integer as active_count,
                coalesce(sum(principal_inr) filter (where status='active'), 0) as total_principal_inr,
@@ -2014,19 +2397,37 @@ async function handleAdminControl(
     }
     if (action === "assign_compounding_plan") {
       const amtInr = Number(body.amount_inr);
-      const uid = String(body.user_id);
+      if (!Number.isFinite(amtInr) || amtInr <= 0) return jsonRes({ error: "Invalid INR amount." }, 400);
+      const q = String(body.user_query || body.user_id || "").trim();
+      const [targetUser] = UUID_RE.test(q)
+        ? await sql`select id, balance_usdt from public.profiles where id = ${q} limit 1`
+        : await sql`select id, balance_usdt from public.profiles where lower(email) = ${q.toLowerCase()} limit 1`;
+      if (!targetUser) return jsonRes({ error: "User not found." }, 404);
+      const uid = String(targetUser.id);
+      const reqUsdt = Math.round((amtInr / USDT_INR_RATE) * 10000) / 10000;
       const [s] = await sql`select * from public.compounding_settings where id = 1`;
       const dur = Number(body.duration_days || s.duration_days || 365);
       const rate = Number(body.daily_rate_pct ?? s.daily_rate_pct ?? 0.746585);
-      const [plan] = await sql`
-        insert into public.compounding_plans (
-          user_id, principal_inr, principal_usdt, current_balance_inr, daily_rate_pct, duration_days,
-          projected_maturity_inr, credit_mode, status, created_by_admin, admin_note
-        ) values (
-          ${uid}, ${amtInr}, ${amtInr / USDT_INR_RATE}, ${amtInr}, ${rate}, ${dur},
-          ${calcProjectedBalance(amtInr, rate, dur)}, ${s.credit_mode}, 'active', true, ${String(body.note || "Assigned by admin")}
-        ) returning *
-      `;
+      const plan = await sql.begin(async (tx: any) => {
+        if (body.deduct_wallet) {
+          const [p] = await tx`select balance_usdt from public.profiles where id = ${uid} for update`;
+          if (Number(p?.balance_usdt || 0) < reqUsdt) throw new Error("User has insufficient wallet balance.");
+          await tx`
+            insert into public.wallet_ledger (user_id, entry_type, amount, description)
+            values (${uid}, 'compounding_invest', ${-reqUsdt}, ${`Admin assigned ${dur}-Day Compounding Plan (₹${amtInr})`})
+          `;
+        }
+        const [ins] = await tx`
+          insert into public.compounding_plans (
+            user_id, principal_inr, principal_usdt, current_balance_inr, daily_rate_pct, duration_days,
+            projected_maturity_inr, credit_mode, status, created_by_admin, admin_note
+          ) values (
+            ${uid}, ${amtInr}, ${reqUsdt}, ${amtInr}, ${rate}, ${dur},
+            ${calcProjectedBalance(amtInr, rate, dur)}, ${s.credit_mode}, 'active', true, ${String(body.note || "Assigned by admin")}
+          ) returning *
+        `;
+        return ins;
+      });
       return jsonRes({ message: `Assigned Plan #${plan.id}`, plan });
     }
     if (action === "manage_compounding_plan") {

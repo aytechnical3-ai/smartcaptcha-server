@@ -108,6 +108,7 @@ create table if not exists public.withdrawal_requests (
   payout_address text,
   status text not null default 'pending' check (status in ('pending', 'approved', 'rejected')),
   required_deposit_usdt numeric(14, 4) not null default 0,
+  tx_id text default '',
   admin_note text,
   created_at timestamptz not null default now(),
   settled_at timestamptz
@@ -152,6 +153,7 @@ create table if not exists public.income_settings (
   signup_bonus_usdt numeric(10, 4) not null default 0,
   fast_start_bonus_usdt numeric(10, 4) not null default 0,
   streak_bonus_usdt numeric(10, 4) not null default 0,
+  extra_config jsonb not null default '{}'::jsonb,
   updated_at timestamptz not null default now()
 );
 insert into public.income_settings (id) values (1) on conflict (id) do nothing;
@@ -408,3 +410,54 @@ as $$
   order by lvl asc, created_at desc
   limit 500;
 $$;
+
+-- 11. Ads & Offerwall Monetization Settings + Postback Revenue Tracking
+create table if not exists public.monetization_settings (
+  id integer primary key default 1 check (id = 1),
+  ads_enabled boolean not null default false,
+  top_banner_img text default '',
+  top_banner_link text default '',
+  ad_script_url text default '',
+  ad_container_id text default '',
+  direct_link_url text default '',
+  direct_link_label text default '🎁 Sponsored Offer — Check Now',
+  offerwall_enabled boolean not null default false,
+  offerwall_name text default 'Offerwall Tasks',
+  offerwall_url text default '',
+  user_share_pct numeric(5, 2) not null default 60.00 check (user_share_pct between 1 and 95),
+  postback_secret text not null default '',
+  updated_at timestamptz not null default now()
+);
+insert into public.monetization_settings (id) values (1) on conflict (id) do nothing;
+
+create table if not exists public.offerwall_postbacks (
+  id bigserial primary key,
+  tx_id text unique not null,
+  user_id uuid not null references public.users(id) on delete cascade,
+  network text not null default 'offerwall',
+  gross_usdt numeric(14, 4) not null check (gross_usdt > 0),
+  user_share_usdt numeric(14, 4) not null check (user_share_usdt >= 0),
+  admin_profit_usdt numeric(14, 4) not null check (admin_profit_usdt >= 0),
+  created_at timestamptz not null default now()
+);
+create index if not exists idx_offerwall_postbacks_user on public.offerwall_postbacks(user_id, created_at desc);
+
+-- 12. 5-Layer Login Security, Token Versioning, TOTP 2FA & Masked Security Audit Logs
+alter table public.users add column if not exists security_pin_hash text not null default '';
+alter table public.users add column if not exists totp_secret text not null default '';
+alter table public.users add column if not exists totp_enabled boolean not null default false;
+alter table public.users add column if not exists token_version integer not null default 1;
+
+create table if not exists public.security_audit_logs (
+  id bigserial primary key,
+  user_id uuid references public.users(id) on delete set null,
+  email text not null default '',
+  event_type text not null,
+  ip_hash text not null default '',
+  ip_masked text not null default '',
+  device_fp text not null default '',
+  details text not null default '',
+  created_at timestamptz not null default now()
+);
+create index if not exists idx_sec_audit_user_created on public.security_audit_logs(user_id, created_at desc);
+create index if not exists idx_sec_audit_created on public.security_audit_logs(created_at desc);
