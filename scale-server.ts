@@ -759,6 +759,19 @@ async function ensureMemberIdSchema(): Promise<void> {
             where id = ${row.id} and (coalesce(member_id, '') = '' or member_id ~ '^[0-9]+$')
           `;
         }
+
+        // Sync existing users' referral_code to match their User ID (member_id) safely
+        await sql`
+          update public.profiles p
+          set referral_code = p.member_id
+          where coalesce(p.member_id, '') <> ''
+            and upper(coalesce(p.referral_code, '')) <> upper(p.member_id)
+            and not exists (
+              select 1 from public.profiles p2
+              where upper(coalesce(p2.referral_code, '')) = upper(p.member_id)
+                and p2.id <> p.id
+            )
+        `;
       } catch (e) {
         _memberIdReadyPromise = null;
         console.error("[ensureMemberIdSchema]", e);
@@ -1378,7 +1391,7 @@ async function handleAuth(pathname: string, req: Request): Promise<Response> {
     `;
     await sql`
       insert into public.profiles (id, email, member_id, referral_code, account_status, is_admin)
-      values (${u.id}, ${u.email}, ${memberId}, ${"SC" + randomCode(6)}, 'active', ${isAdmin})
+      values (${u.id}, ${u.email}, ${memberId}, ${memberId}, 'active', ${isAdmin})
     `;
     safeIncrIfCached("cache:users_count");
     safeIncrIfCached("cache:reg_count");
@@ -1753,7 +1766,12 @@ async function routeRequest(req: Request): Promise<Response> {
         let sponsorId = prof.referred_by;
         if (!sponsorId && body.referral_code) {
           const ref = String(body.referral_code).trim().toUpperCase();
-          const [sp] = await sql`select id from public.profiles where referral_code = ${ref} and id <> ${user.id} limit 1`;
+          const [sp] = await sql`
+            select id from public.profiles
+            where (upper(coalesce(referral_code, '')) = ${ref} or upper(coalesce(member_id, '')) = ${ref})
+              and id <> ${user.id}
+            limit 1
+          `;
           if (sp) sponsorId = sp.id;
         }
         await sql`
@@ -2608,6 +2626,12 @@ async function handleAdminControl(
           if (dupMid) return jsonRes({ error: "That User ID Number is already assigned to another user." }, 409);
           await sql`update public.users set member_id = ${nextMid} where id = ${uid}`;
           await sql`update public.profiles set member_id = ${nextMid} where id = ${uid}`;
+          if (body.own_referral_code === undefined || String(body.own_referral_code || "").trim().toUpperCase() === nextMid) {
+            const [dupOwn] = await sql`select id from public.profiles where upper(coalesce(referral_code, '')) = ${nextMid} and id <> ${uid} limit 1`;
+            if (!dupOwn) {
+              await sql`update public.profiles set referral_code = ${nextMid} where id = ${uid}`;
+            }
+          }
         }
       }
 
@@ -2638,7 +2662,12 @@ async function handleAdminControl(
       if (refRaw === "NONE") {
         await sql`update public.profiles set referred_by = null where id = ${uid}`;
       } else if (refRaw) {
-        const [sp] = await sql`select id from public.profiles where upper(referral_code) = ${refRaw} and id <> ${uid} limit 1`;
+        const [sp] = await sql`
+          select id from public.profiles
+          where (upper(coalesce(referral_code, '')) = ${refRaw} or upper(coalesce(member_id, '')) = ${refRaw})
+            and id <> ${uid}
+          limit 1
+        `;
         if (!sp) return jsonRes({ error: "Sponsor referral code not found." }, 404);
         await sql`update public.profiles set referred_by = ${sp.id} where id = ${uid}`;
       }
