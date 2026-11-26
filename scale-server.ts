@@ -621,9 +621,13 @@ async function ensureMonetizationTables() {
         offerwall_url text default '',
         user_share_pct numeric(5, 2) not null default 60.00 check (user_share_pct between 1 and 95),
         postback_secret text not null default '',
+        ad_mediation_mode text not null default 'highest_cpm_fallback',
+        ad_networks_json jsonb not null default '[]'::jsonb,
         updated_at timestamptz not null default now()
       )
     `;
+    await sql`alter table public.monetization_settings add column if not exists ad_mediation_mode text not null default 'highest_cpm_fallback'`;
+    await sql`alter table public.monetization_settings add column if not exists ad_networks_json jsonb not null default '[]'::jsonb`;
     const randSecret = randomCode(24);
     await sql`
       insert into public.monetization_settings (id, postback_secret)
@@ -1223,10 +1227,10 @@ async function getCachedMonetizationPublic() {
     () => sql`
       select ads_enabled, top_banner_img, top_banner_link, ad_script_url, ad_container_id,
              direct_link_url, direct_link_label, offerwall_enabled, offerwall_name,
-             offerwall_url, user_share_pct
+             offerwall_url, user_share_pct, ad_mediation_mode, ad_networks_json
       from public.monetization_settings where id = 1
     `,
-    { ads_enabled: false, offerwall_enabled: false, user_share_pct: 60 }
+    { ads_enabled: false, offerwall_enabled: false, user_share_pct: 60, ad_mediation_mode: "highest_cpm_fallback", ad_networks_json: [] }
   );
 }
 
@@ -1471,12 +1475,12 @@ async function handleAuth(pathname: string, req: Request): Promise<Response> {
       return jsonRes({
         requires_pin_setup: true,
         setup_token: setupToken,
-        message: "Shield 2 setup: Create a 4 to 6 digit Security PIN to activate your 5-Layer Login Protection.",
+        message: "Create a 4 to 6 digit Security PIN to continue.",
       }, 200, req);
     }
     if (!/^\d{4,6}$/.test(pin) || !(await verifyPassword(pin, u.security_pin_hash))) {
       await recordFail("login_failed_pin", "Wrong 6-digit Security PIN");
-      return jsonRes({ error: "Invalid Security PIN (Shield 2).", code: "PIN_INVALID" }, 401, req);
+      return jsonRes({ error: "Invalid Security PIN.", code: "PIN_INVALID" }, 401, req);
     }
 
     // Optional Extra Shield: Authenticator TOTP 2FA (when enabled)
@@ -1544,7 +1548,7 @@ async function handleAuth(pathname: string, req: Request): Promise<Response> {
     return jsonRes({
       user: uOut,
       session: { access_token, user: uOut },
-      message: "5-Layer Security PIN activated!",
+      message: "Security PIN saved!",
     }, 200, req);
   }
 
@@ -2353,7 +2357,7 @@ async function handleAdminControl(
       ] = await Promise.all([
         sql`
           select p.id, p.member_id, p.email, p.full_name, p.phone, p.gender,
-                 to_char(p.date_of_birth, 'YYYY-MM-DD') as date_of_birth,
+                 left(coalesce(p.date_of_birth::text, ''), 10) as date_of_birth,
                  p.city, p.state, p.pin_code,
                  p.referral_code, p.referred_by,
                  sp.full_name as sponsor_name, sp.email as sponsor_email, sp.referral_code as sponsor_referral_code,
@@ -2681,12 +2685,14 @@ async function handleAdminControl(
           full_name = case when ${hasFullName} then ${hasFullName ? String(body.full_name).trim() : ""} else full_name end,
           phone = case when ${hasPhone} then ${hasPhone ? String(body.phone).trim() : ""} else phone end,
           gender = case when ${hasGender} then ${hasGender ? String(body.gender) : ""} else gender end,
-          date_of_birth = case when ${hasDob} then ${dobVal}::date else date_of_birth end,
           state = case when ${hasState} then ${hasState ? String(body.state).trim() : ""} else state end,
           city = case when ${hasCity} then ${hasCity ? String(body.city).trim() : ""} else city end,
           pin_code = case when ${hasPinCode} then ${hasPinCode ? String(body.pin_code).trim() : ""} else pin_code end
         where id = ${uid}
       `;
+      if (hasDob) {
+        await sql`update public.profiles set date_of_birth = ${dobVal}::date where id = ${uid}`;
+      }
 
       if (body.total_captchas_solved !== undefined && body.total_captchas_solved !== "" && Number.isFinite(Number(body.total_captchas_solved))) {
         const totCap = Math.max(0, Math.round(Number(body.total_captchas_solved)));
@@ -3387,6 +3393,31 @@ async function handleAdminControl(
       if (!Number.isFinite(sharePct) || sharePct < 1 || sharePct > 95) {
         return jsonRes({ error: "User share must be between 1% and 95%." }, 400);
       }
+      const allowedMedModes = new Set(["highest_cpm_fallback", "smart_rotate", "multi_stack"]);
+      const adMediationMode = allowedMedModes.has(String(body.ad_mediation_mode || ""))
+        ? String(body.ad_mediation_mode)
+        : "highest_cpm_fallback";
+      const rawSlots = Array.isArray(body.ad_networks) ? body.ad_networks.slice(0, 5) : [];
+      const adNetworks = rawSlots.map((slot: any, idx: number) => {
+        const fmtRaw = String(slot?.format || "script");
+        const fmt = fmtRaw === "atoptions" || fmtRaw === "socialbar" ? fmtRaw : "script";
+        const w = Math.max(50, Math.min(1200, Math.round(Number(slot?.banner_width ?? 300) || 300)));
+        const h = Math.max(40, Math.min(1200, Math.round(Number(slot?.banner_height ?? 250) || 250)));
+        const cpmRaw = Number(slot?.est_cpm ?? 0);
+        const estCpm = Number.isFinite(cpmRaw) ? Math.max(0, Math.min(1000, Math.round(cpmRaw * 100) / 100)) : 0;
+        return {
+          enabled: Boolean(slot?.enabled),
+          name: String(slot?.name || `Network ${idx + 1}`).trim().slice(0, 40),
+          format: fmt,
+          script_url: isSafeHttpsUrl(slot?.script_url),
+          container_id: String(slot?.container_id || "").trim().replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 80),
+          banner_key: String(slot?.banner_key || "").trim().replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 64),
+          banner_width: w,
+          banner_height: h,
+          est_cpm: estCpm,
+          direct_url: isSafeHttpsUrl(slot?.direct_url),
+        };
+      });
       await sql`
         update public.monetization_settings set
           ads_enabled = ${Boolean(body.ads_enabled)},
@@ -3400,11 +3431,13 @@ async function handleAdminControl(
           offerwall_name = ${offerwallName},
           offerwall_url = ${offerwallUrl},
           user_share_pct = ${sharePct},
+          ad_mediation_mode = ${adMediationMode},
+          ad_networks_json = ${JSON.stringify(adNetworks)}::jsonb,
           updated_at = now()
         where id = 1
       `;
       await redis.del("cache:monetization_public");
-      return jsonRes({ message: "Ads & Offerwall settings saved." });
+      return jsonRes({ message: "Ads, Auto High-CPM Mediation & Offerwall settings saved." });
     }
     if (action === "rotate_postback_secret") {
       const nextSecret = randomCode(24);
