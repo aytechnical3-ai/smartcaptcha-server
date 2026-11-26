@@ -861,92 +861,100 @@ function ensureIncomeTables(): Promise<void> {
             add column if not exists total_captchas_solved bigint not null default 0,
             add column if not exists today_captchas_count integer not null default 0,
             add column if not exists today_captchas_date date not null default ((now() at time zone 'Asia/Kolkata')::date)
-        `;
-        await sql`create index if not exists idx_wallet_ledger_user_created on public.wallet_ledger(user_id, created_at desc)`;
-        await sql`
-          create or replace function public.fn_sync_profile_balance_from_ledger()
-          returns trigger
-          language plpgsql
-          security definer
-          set search_path = public
-          as $$
-          begin
-            if tg_op = 'INSERT' then
-              update public.profiles
-              set balance_usdt = round((coalesce(balance_usdt, 0) + new.amount)::numeric, 4)
-              where id = new.user_id;
-              return new;
-            elsif tg_op = 'DELETE' then
-              update public.profiles
-              set balance_usdt = round((coalesce(balance_usdt, 0) - old.amount)::numeric, 4)
-              where id = old.user_id;
-              return old;
-            end if;
-            return null;
-          end;
-          $$
-        `;
-        await sql`drop trigger if exists trg_wallet_ledger_sync_balance on public.wallet_ledger`;
-        await sql`
-          create trigger trg_wallet_ledger_sync_balance
-            after insert or delete on public.wallet_ledger
-            for each row
-            execute function public.fn_sync_profile_balance_from_ledger()
-        `;
-        await sql`
-          create or replace function public.batch_credit_captchas(p_items jsonb)
-          returns jsonb
-          language plpgsql
-          security definer
-          set search_path = public
-          as $$
-          declare
-            v_today date := (now() at time zone 'Asia/Kolkata')::date;
-            v_users integer := 0;
-            v_captchas bigint := 0;
-          begin
-            if p_items is null or jsonb_typeof(p_items) <> 'array' or jsonb_array_length(p_items) = 0 then
-              return jsonb_build_object('ok', true, 'users', 0, 'captchas', 0);
-            end if;
-            with parsed as (
-              select
-                (item->>'user_id')::uuid as user_id,
-                greatest(0, (item->>'solved')::bigint) as solved,
-                round(greatest(0, (item->>'reward_usdt')::numeric), 4) as reward_usdt
-              from jsonb_array_elements(p_items) as item
-              where (item->>'solved')::bigint > 0
-            ),
-            upd_profiles as (
-              update public.profiles p
-              set
-                total_captchas_solved = coalesce(p.total_captchas_solved, 0) + x.solved,
-                today_captchas_count = case
-                  when p.today_captchas_date = v_today then coalesce(p.today_captchas_count, 0) + x.solved::integer
-                  else x.solved::integer
-                end,
-                today_captchas_date = v_today
-              from parsed x
-              where p.id = x.user_id
-              returning p.id
-            ),
-            ins_ledger as (
-              insert into public.wallet_ledger (user_id, entry_type, amount, description)
-              select
-                x.user_id,
-                'captcha_income',
-                x.reward_usdt,
-                format('Captcha batch credit (%s solved)', x.solved)
-              from parsed x
-              where x.reward_usdt > 0
-              returning user_id
-            )
-            select count(*)::integer, coalesce(sum(solved), 0)::bigint
-            into v_users, v_captchas
-            from parsed;
-            return jsonb_build_object('ok', true, 'users', v_users, 'captchas', v_captchas, 'day', v_today);
-          end;
-          $$
-        `;
+        `.catch((e) => console.error("[ensureIncomeTables profiles cols]", e));
+        await sql`create index if not exists idx_wallet_ledger_user_created on public.wallet_ledger(user_id, created_at desc)`.catch(() => {});
+        try {
+          await sql`
+            create or replace function public.fn_sync_profile_balance_from_ledger()
+            returns trigger
+            language plpgsql
+            security definer
+            set search_path = public
+            as $$
+            begin
+              if tg_op = 'INSERT' then
+                update public.profiles
+                set balance_usdt = round((coalesce(balance_usdt, 0) + new.amount)::numeric, 4)
+                where id = new.user_id;
+                return new;
+              elsif tg_op = 'DELETE' then
+                update public.profiles
+                set balance_usdt = round((coalesce(balance_usdt, 0) - old.amount)::numeric, 4)
+                where id = old.user_id;
+                return old;
+              end if;
+              return null;
+            end;
+            $$
+          `;
+          await sql`drop trigger if exists trg_wallet_ledger_sync_balance on public.wallet_ledger`;
+          await sql`
+            create trigger trg_wallet_ledger_sync_balance
+              after insert or delete on public.wallet_ledger
+              for each row
+              execute function public.fn_sync_profile_balance_from_ledger()
+          `;
+        } catch (e) {
+          console.error("[ensureIncomeTables trigger]", e);
+        }
+        try {
+          await sql`
+            create or replace function public.batch_credit_captchas(p_items jsonb)
+            returns jsonb
+            language plpgsql
+            security definer
+            set search_path = public
+            as $$
+            declare
+              v_today date := (now() at time zone 'Asia/Kolkata')::date;
+              v_users integer := 0;
+              v_captchas bigint := 0;
+            begin
+              if p_items is null or jsonb_typeof(p_items) <> 'array' or jsonb_array_length(p_items) = 0 then
+                return jsonb_build_object('ok', true, 'users', 0, 'captchas', 0);
+              end if;
+              with parsed as (
+                select
+                  (item->>'user_id')::uuid as user_id,
+                  greatest(0, (item->>'solved')::bigint) as solved,
+                  round(greatest(0, (item->>'reward_usdt')::numeric), 4) as reward_usdt
+                from jsonb_array_elements(p_items) as item
+                where (item->>'solved')::bigint > 0
+              ),
+              upd_profiles as (
+                update public.profiles p
+                set
+                  total_captchas_solved = coalesce(p.total_captchas_solved, 0) + x.solved,
+                  today_captchas_count = case
+                    when p.today_captchas_date = v_today then coalesce(p.today_captchas_count, 0) + x.solved::integer
+                    else x.solved::integer
+                  end,
+                  today_captchas_date = v_today
+                from parsed x
+                where p.id = x.user_id
+                returning p.id
+              ),
+              ins_ledger as (
+                insert into public.wallet_ledger (user_id, entry_type, amount, description)
+                select
+                  x.user_id,
+                  'captcha_income',
+                  x.reward_usdt,
+                  format('Captcha batch credit (%s solved)', x.solved)
+                from parsed x
+                where x.reward_usdt > 0
+                returning user_id
+              )
+              select count(*)::integer, coalesce(sum(solved), 0)::bigint
+              into v_users, v_captchas
+              from parsed;
+              return jsonb_build_object('ok', true, 'users', v_users, 'captchas', v_captchas, 'day', v_today);
+            end;
+            $$
+          `;
+        } catch (e) {
+          console.error("[ensureIncomeTables batch_credit_captchas]", e);
+        }
         await sql`
           update public.profiles p
           set balance_usdt = coalesce(sub.bal, 0)
@@ -957,7 +965,7 @@ function ensureIncomeTables(): Promise<void> {
           ) sub
           where p.id = sub.user_id
             and abs(coalesce(p.balance_usdt, 0) - coalesce(sub.bal, 0)) > 0.0001
-        `;
+        `.catch(() => {});
         await sql`
           create table if not exists public.daily_captcha_completions (
             user_id uuid not null references public.users(id) on delete cascade,
@@ -1759,7 +1767,7 @@ async function routeRequest(req: Request): Promise<Response> {
     if (path === "/health" || path === "/") {
       try {
         await Promise.all([sql`select 1`, redis.ping()]);
-        return jsonRes({ ok: true, status: "healthy", mode: "hetzner-standalone" }, 200, req);
+        return jsonRes({ ok: true, status: "healthy", mode: "hetzner-standalone", version: "2026-11-26-instant-credit-v2" }, 200, req);
       } catch (e: any) {
         return jsonRes({ ok: false, error: e?.message || "unhealthy" }, 503, req);
       }
@@ -2033,42 +2041,50 @@ async function getUserTodayCaptchaState(userId: string) {
   const redisDay = Number(redisDayRaw || 0);
 
   if (dbToday === 0 && (pCnt || 0) === 0 && redisDay > 0) {
-    const lockOk = await redis.set(`cap_day_recovered:${today}:${userId}`, "1", "EX", 100_000, "NX").catch(() => null);
+    const recLockKey = `cap_day_recovered:${today}:${userId}`;
+    const lockOk = await redis.set(recLockKey, "1", "EX", 100_000, "NX").catch(() => null);
     if (lockOk) {
-      const [incSet, [todayCapRow]] = await Promise.all([
-        getCachedIncomeSettings(),
-        sql`select count(*)::integer as cnt from public.wallet_ledger where user_id = ${userId}::uuid and entry_type = 'captcha_income' and (created_at at time zone 'Asia/Kolkata')::date = ${today}::date`,
-      ]);
-      const limit = Math.max(0, Number(incSet.captcha_daily_limit ?? 50));
-      const { rewardUsdt } = resolveCaptchaRewards(incSet);
-      const recCount = limit > 0 ? Math.min(redisDay, limit) : redisDay;
-      if (Number(todayCapRow?.cnt || 0) === 0 && incSet.income_enabled !== false && recCount > 0 && rewardUsdt > 0) {
-        const recUsdt = Math.round(recCount * rewardUsdt * 10000) / 10000;
-        const recInr = Math.round(recUsdt * USDT_INR_RATE * 100) / 100;
-        await sql.begin(async (tx: any) => {
-          await tx`
-            insert into public.wallet_ledger (user_id, entry_type, amount, description)
-            values (${userId}::uuid, 'captcha_income', ${recUsdt}, ${`Captcha reward recovery (${recCount} solved · ₹${recInr})`})
-          `;
-          await tx`
-            update public.profiles p
-            set
-              total_captchas_solved = coalesce(p.total_captchas_solved, 0) + ${recCount},
-              today_captchas_count = ${recCount},
-              today_captchas_date = ${today}::date,
-              balance_usdt = coalesce((
-                select round(sum(w.amount)::numeric, 4)
-                from public.wallet_ledger w
-                where w.user_id = p.id
-              ), 0)
-            where p.id = ${userId}::uuid
-          `;
-        });
-        const [freshProf] = await sql`select balance_usdt, total_captchas_solved, today_captchas_count, to_char((today_captchas_date)::date, 'YYYY-MM-DD') as db_day from public.profiles where id = ${userId} limit 1`;
-        if (freshProf) {
-          Object.assign(prof, freshProf);
-          dbToday = freshProf.db_day === today ? Number(freshProf.today_captchas_count || 0) : 0;
+      try {
+        const [incSet, [todayCapRow]] = await Promise.all([
+          getCachedIncomeSettings(),
+          sql`select count(*)::integer as cnt from public.wallet_ledger where user_id = ${userId}::uuid and entry_type = 'captcha_income' and (created_at at time zone 'Asia/Kolkata')::date = ${today}::date`,
+        ]);
+        const limit = Math.max(0, Number(incSet.captcha_daily_limit ?? 50));
+        const { rewardUsdt } = resolveCaptchaRewards(incSet);
+        const recCount = limit > 0 ? Math.min(redisDay, limit) : redisDay;
+        if (Number(todayCapRow?.cnt || 0) === 0 && incSet.income_enabled !== false && recCount > 0 && rewardUsdt > 0) {
+          const recUsdt = Math.round(recCount * rewardUsdt * 10000) / 10000;
+          const recInr = Math.round(recUsdt * USDT_INR_RATE * 100) / 100;
+          await sql.begin(async (tx: any) => {
+            await tx`
+              insert into public.wallet_ledger (user_id, entry_type, amount, description)
+              values (${userId}::uuid, 'captcha_income', ${recUsdt}, ${`Captcha reward recovery (${recCount} solved · ₹${recInr})`})
+            `;
+            await tx`
+              update public.profiles p
+              set
+                total_captchas_solved = coalesce(p.total_captchas_solved, 0) + ${recCount},
+                today_captchas_count = ${recCount},
+                today_captchas_date = ${today}::date,
+                balance_usdt = coalesce((
+                  select round(sum(w.amount)::numeric, 4)
+                  from public.wallet_ledger w
+                  where w.user_id = p.id
+                ), 0)
+              where p.id = ${userId}::uuid
+            `;
+          });
+          const [freshProf] = await sql`select balance_usdt, total_captchas_solved, today_captchas_count, to_char((today_captchas_date)::date, 'YYYY-MM-DD') as db_day from public.profiles where id = ${userId} limit 1`;
+          if (freshProf) {
+            Object.assign(prof, freshProf);
+            dbToday = freshProf.db_day === today ? Number(freshProf.today_captchas_count || 0) : 0;
+          }
+        } else {
+          await redis.del(recLockKey).catch(() => {});
         }
+      } catch (e) {
+        await redis.del(recLockKey).catch(() => {});
+        console.error("[cap_day recovery]", e);
       }
     }
   }
