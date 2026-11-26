@@ -1,0 +1,35 @@
+# ==============================================================================
+# GitHub Actions: Auto-Deploy SmartCaptcha Backend to Hetzner on Git Push
+# Save this file inside your GitHub repository at:
+#   .github/workflows/deploy.yml
+#
+# Required GitHub Secrets (Repo -> Settings -> Secrets and variables -> Actions):
+#   HETZNER_HOST    -> Your Hetzner Server IPv4 address
+#   HETZNER_USER    -> root
+#   HETZNER_SSH_KEY -> Private SSH key added to your Hetzner server
+# ==============================================================================
+
+name: Deploy to Hetzner
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pull latest code and restart containers on Hetzner
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HETZNER_HOST }}
+          username: ${{ secrets.HETZNER_USER }}
+          key: ${{ secrets.HETZNER_SSH_KEY }}
+          script: |
+            set -e
+            cd /opt/smartcaptcha
+            git pull origin main
+            docker compose -f docker-compose.scale.yml up -d --remove-orphans
+            docker compose -f docker-compose.scale.yml restart api
+            docker compose -f docker-compose.scale.yml ps

@@ -2007,6 +2007,9 @@ const EARNED_INCOME_TYPES = [
 
 async function getUserTodayCaptchaState(userId: string) {
   await ensureIncomeTables();
+  if (flushing && activeFlushPromise) {
+    await activeFlushPromise.catch(() => {});
+  }
   const today = todayIst();
   const dailyKey = `cap_day:${today}:${userId}`;
   const [profRows, pendingRaw, flushKeys, redisDayRaw] = await Promise.all([
@@ -2026,8 +2029,50 @@ async function getUserTodayCaptchaState(userId: string) {
       pUsdt += fu;
     }
   }
-  const dbToday = prof.db_day === today ? Number(prof.today_captchas_count || 0) : 0;
+  let dbToday = prof.db_day === today ? Number(prof.today_captchas_count || 0) : 0;
   const redisDay = Number(redisDayRaw || 0);
+
+  if (dbToday === 0 && (pCnt || 0) === 0 && redisDay > 0) {
+    const lockOk = await redis.set(`cap_day_recovered:${today}:${userId}`, "1", "EX", 100_000, "NX").catch(() => null);
+    if (lockOk) {
+      const [incSet, [todayCapRow]] = await Promise.all([
+        getCachedIncomeSettings(),
+        sql`select count(*)::integer as cnt from public.wallet_ledger where user_id = ${userId}::uuid and entry_type = 'captcha_income' and (created_at at time zone 'Asia/Kolkata')::date = ${today}::date`,
+      ]);
+      const limit = Math.max(0, Number(incSet.captcha_daily_limit ?? 50));
+      const { rewardUsdt } = resolveCaptchaRewards(incSet);
+      const recCount = limit > 0 ? Math.min(redisDay, limit) : redisDay;
+      if (Number(todayCapRow?.cnt || 0) === 0 && incSet.income_enabled !== false && recCount > 0 && rewardUsdt > 0) {
+        const recUsdt = Math.round(recCount * rewardUsdt * 10000) / 10000;
+        const recInr = Math.round(recUsdt * USDT_INR_RATE * 100) / 100;
+        await sql.begin(async (tx: any) => {
+          await tx`
+            insert into public.wallet_ledger (user_id, entry_type, amount, description)
+            values (${userId}::uuid, 'captcha_income', ${recUsdt}, ${`Captcha reward recovery (${recCount} solved · ₹${recInr})`})
+          `;
+          await tx`
+            update public.profiles p
+            set
+              total_captchas_solved = coalesce(p.total_captchas_solved, 0) + ${recCount},
+              today_captchas_count = ${recCount},
+              today_captchas_date = ${today}::date,
+              balance_usdt = coalesce((
+                select round(sum(w.amount)::numeric, 4)
+                from public.wallet_ledger w
+                where w.user_id = p.id
+              ), 0)
+            where p.id = ${userId}::uuid
+          `;
+        });
+        const [freshProf] = await sql`select balance_usdt, total_captchas_solved, today_captchas_count, to_char((today_captchas_date)::date, 'YYYY-MM-DD') as db_day from public.profiles where id = ${userId} limit 1`;
+        if (freshProf) {
+          Object.assign(prof, freshProf);
+          dbToday = freshProf.db_day === today ? Number(freshProf.today_captchas_count || 0) : 0;
+        }
+      }
+    }
+  }
+
   const todayPassed = Math.max(0, dbToday + (pCnt || 0));
   if (todayPassed > 0 && redisDay !== todayPassed) {
     await redis.set(dailyKey, String(todayPassed), "EX", 100_000);
