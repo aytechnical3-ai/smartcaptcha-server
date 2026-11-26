@@ -349,22 +349,66 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 let flushing = false;
 let activeFlushPromise: Promise<{ users: number; captchas: number }> | null = null;
 
+async function syncUserBalanceFromLedger(txOrSql: any, userId: string): Promise<number> {
+  const [r] = await txOrSql`
+    update public.profiles p
+    set balance_usdt = coalesce((
+      select round(sum(w.amount)::numeric, 4)
+      from public.wallet_ledger w
+      where w.user_id = p.id
+    ), 0)
+    where p.id = ${userId}::uuid
+    returning balance_usdt
+  `;
+  return Number(r?.balance_usdt || 0);
+}
+
 async function processFlushHashKey(processingKey: string): Promise<{ users: number; captchas: number }> {
   const rawMap = await redis.hgetall(processingKey);
   const payload: Array<{ user_id: string; solved: number; reward_usdt: number }> = [];
   for (const [userId, val] of Object.entries(rawMap)) {
     if (!UUID_RE.test(userId)) continue;
     const [cntStr, usdtStr] = String(val).split(":");
-    const solved = Number(cntStr || 0);
-    const rewardUsdt = Number(usdtStr || 0);
-    if (solved > 0) payload.push({ user_id: userId, solved, reward_usdt: Math.round(rewardUsdt * 10000) / 10000 });
+    const solved = Math.max(0, Math.round(Number(cntStr || 0)));
+    const rewardUsdt = Math.max(0, Math.round(Number(usdtStr || 0) * 10000) / 10000);
+    if (solved > 0) payload.push({ user_id: userId, solved, reward_usdt: rewardUsdt });
   }
+  if (!payload.length) {
+    await redis.del(processingKey);
+    return { users: 0, captchas: 0 };
+  }
+  const today = todayIst();
   let totalUsers = 0, totalCaptchas = 0;
-  for (let i = 0; i < payload.length; i += 1000) {
-    const chunk = payload.slice(i, i + 1000);
-    const res = await sql`select public.batch_credit_captchas(${JSON.stringify(chunk)}::jsonb) as res`;
-    totalUsers += Number(res[0]?.res?.users || 0);
-    totalCaptchas += Number(res[0]?.res?.captchas || 0);
+  for (let i = 0; i < payload.length; i += 200) {
+    const chunk = payload.slice(i, i + 200);
+    await sql.begin(async (tx: any) => {
+      for (const item of chunk) {
+        if (item.reward_usdt > 0) {
+          await tx`
+            insert into public.wallet_ledger (user_id, entry_type, amount, description)
+            values (${item.user_id}::uuid, 'captcha_income', ${item.reward_usdt}, ${`Captcha batch credit (${item.solved} solved)`})
+          `;
+        }
+        await tx`
+          update public.profiles p
+          set
+            total_captchas_solved = coalesce(p.total_captchas_solved, 0) + ${item.solved},
+            today_captchas_count = case
+              when p.today_captchas_date = ${today}::date then coalesce(p.today_captchas_count, 0) + ${item.solved}
+              else ${item.solved}
+            end,
+            today_captchas_date = ${today}::date,
+            balance_usdt = coalesce((
+              select round(sum(w.amount)::numeric, 4)
+              from public.wallet_ledger w
+              where w.user_id = p.id
+            ), 0)
+          where p.id = ${item.user_id}::uuid
+        `;
+        totalUsers++;
+        totalCaptchas += item.solved;
+      }
+    });
   }
   await redis.del(processingKey);
   return { users: totalUsers, captchas: totalCaptchas };
@@ -375,9 +419,10 @@ async function flushPendingCaptchas(): Promise<{ users: number; captchas: number
   flushing = true;
   activeFlushPromise = (async () => {
     try {
+      await ensureIncomeTables();
       // Recover any orphaned flush keys older than current run
       const orphans = await redis.keys("pending:captchas:flush:*").catch(() => []);
-      for (const k of orphans.slice(0, 5)) {
+      for (const k of orphans.slice(0, 20)) {
         try { await processFlushHashKey(k); } catch (e) { console.error("[orphan flush retry]", e); }
       }
 
@@ -811,6 +856,109 @@ function ensureIncomeTables(): Promise<void> {
     incomeTablesPromise = (async () => {
       try {
         await sql`
+          alter table public.profiles
+            add column if not exists balance_usdt numeric(14, 4) not null default 0,
+            add column if not exists total_captchas_solved bigint not null default 0,
+            add column if not exists today_captchas_count integer not null default 0,
+            add column if not exists today_captchas_date date not null default ((now() at time zone 'Asia/Kolkata')::date)
+        `;
+        await sql`create index if not exists idx_wallet_ledger_user_created on public.wallet_ledger(user_id, created_at desc)`;
+        await sql`
+          create or replace function public.fn_sync_profile_balance_from_ledger()
+          returns trigger
+          language plpgsql
+          security definer
+          set search_path = public
+          as $$
+          begin
+            if tg_op = 'INSERT' then
+              update public.profiles
+              set balance_usdt = round((coalesce(balance_usdt, 0) + new.amount)::numeric, 4)
+              where id = new.user_id;
+              return new;
+            elsif tg_op = 'DELETE' then
+              update public.profiles
+              set balance_usdt = round((coalesce(balance_usdt, 0) - old.amount)::numeric, 4)
+              where id = old.user_id;
+              return old;
+            end if;
+            return null;
+          end;
+          $$
+        `;
+        await sql`drop trigger if exists trg_wallet_ledger_sync_balance on public.wallet_ledger`;
+        await sql`
+          create trigger trg_wallet_ledger_sync_balance
+            after insert or delete on public.wallet_ledger
+            for each row
+            execute function public.fn_sync_profile_balance_from_ledger()
+        `;
+        await sql`
+          create or replace function public.batch_credit_captchas(p_items jsonb)
+          returns jsonb
+          language plpgsql
+          security definer
+          set search_path = public
+          as $$
+          declare
+            v_today date := (now() at time zone 'Asia/Kolkata')::date;
+            v_users integer := 0;
+            v_captchas bigint := 0;
+          begin
+            if p_items is null or jsonb_typeof(p_items) <> 'array' or jsonb_array_length(p_items) = 0 then
+              return jsonb_build_object('ok', true, 'users', 0, 'captchas', 0);
+            end if;
+            with parsed as (
+              select
+                (item->>'user_id')::uuid as user_id,
+                greatest(0, (item->>'solved')::bigint) as solved,
+                round(greatest(0, (item->>'reward_usdt')::numeric), 4) as reward_usdt
+              from jsonb_array_elements(p_items) as item
+              where (item->>'solved')::bigint > 0
+            ),
+            upd_profiles as (
+              update public.profiles p
+              set
+                total_captchas_solved = coalesce(p.total_captchas_solved, 0) + x.solved,
+                today_captchas_count = case
+                  when p.today_captchas_date = v_today then coalesce(p.today_captchas_count, 0) + x.solved::integer
+                  else x.solved::integer
+                end,
+                today_captchas_date = v_today
+              from parsed x
+              where p.id = x.user_id
+              returning p.id
+            ),
+            ins_ledger as (
+              insert into public.wallet_ledger (user_id, entry_type, amount, description)
+              select
+                x.user_id,
+                'captcha_income',
+                x.reward_usdt,
+                format('Captcha batch credit (%s solved)', x.solved)
+              from parsed x
+              where x.reward_usdt > 0
+              returning user_id
+            )
+            select count(*)::integer, coalesce(sum(solved), 0)::bigint
+            into v_users, v_captchas
+            from parsed;
+            return jsonb_build_object('ok', true, 'users', v_users, 'captchas', v_captchas, 'day', v_today);
+          end;
+          $$
+        `;
+        await sql`
+          update public.profiles p
+          set balance_usdt = coalesce(sub.bal, 0)
+          from (
+            select user_id, round(coalesce(sum(amount), 0)::numeric, 4) as bal
+            from public.wallet_ledger
+            group by user_id
+          ) sub
+          where p.id = sub.user_id
+            and abs(coalesce(p.balance_usdt, 0) - coalesce(sub.bal, 0)) > 0.0001
+        `;
+        await sql`
           create table if not exists public.daily_captcha_completions (
             user_id uuid not null references public.users(id) on delete cascade,
             completion_date date not null,
@@ -855,13 +1003,14 @@ function ensureIncomeTables(): Promise<void> {
         await sql`insert into public.income_settings (id) values (1) on conflict (id) do nothing`;
         await sql`insert into public.compounding_settings (id) values (1) on conflict (id) do nothing`;
       } catch (e) {
+        incomeTablesPromise = null;
         console.error("[ensureIncomeTables]", e);
       }
     })();
   }
   return incomeTablesPromise;
 }
-ensureIncomeTables();
+ensureIncomeTables().then(() => flushPendingCaptchas()).catch(() => {});
 
 async function getSpentInrForDay(day: string): Promise<number> {
   const [[spentRow], pendingRows] = await Promise.all([
@@ -899,7 +1048,7 @@ async function creditSignupBonusIfEligible(userId: string): Promise<number> {
   const today = todayIst();
   const capInr = Math.max(0, Number(inc.daily_company_cap_inr ?? 50000));
   const spent = capInr > 0 ? await getSpentInrForDay(today) : 0;
-  if (capInr <= 0 || spent + bonusInr > capInr) return 0;
+  if (capInr > 0 && spent + bonusInr > capInr) return 0;
 
   const amtUsdt = Math.round((bonusInr / USDT_INR_RATE) * 10000) / 10000;
   if (amtUsdt <= 0) return 0;
@@ -939,7 +1088,7 @@ async function checkAndCreditFastStartBonus(sponsorId: string): Promise<number> 
   const today = todayIst();
   const capInr = Math.max(0, Number(inc.daily_company_cap_inr ?? 50000));
   const spent = capInr > 0 ? await getSpentInrForDay(today) : 0;
-  if (capInr <= 0 || spent + bonusInr > capInr) return 0;
+  if (capInr > 0 && spent + bonusInr > capInr) return 0;
 
   const amtUsdt = Math.round((bonusInr / USDT_INR_RATE) * 10000) / 10000;
   if (amtUsdt <= 0) return 0;
@@ -984,7 +1133,7 @@ async function checkAndCreditStreakBonus(userId: string, day: string): Promise<n
 
   const capInr = Math.max(0, Number(inc.daily_company_cap_inr ?? 50000));
   const spent = capInr > 0 ? await getSpentInrForDay(day) : 0;
-  if (capInr <= 0 || spent + bonusInr > capInr) return 0;
+  if (capInr > 0 && spent + bonusInr > capInr) return 0;
 
   const amtUsdt = Math.round((bonusInr / USDT_INR_RATE) * 10000) / 10000;
   if (amtUsdt <= 0) return 0;
@@ -1039,8 +1188,8 @@ async function processLevelIncomeForCompletion(
 
   const companyCap = Math.max(0, Number(inc.daily_company_cap_inr ?? 50000));
   const spentToday = companyCap > 0 ? await getSpentInrForDay(day) : 0;
-  let remCap = companyCap > 0 ? Math.max(0, companyCap - spentToday) : 0;
-  if (remCap <= 0) return { credited_count: 0, credited_inr: 0 };
+  let remCap = companyCap > 0 ? Math.max(0, companyCap - spentToday) : Number.MAX_SAFE_INTEGER;
+  if (companyCap > 0 && remCap <= 0) return { credited_count: 0, credited_inr: 0 };
 
   const maxLevels = Math.min(8, Math.max(1, Math.round(Number(inc.active_levels ?? 8))));
   const onceArr: number[] = Array.isArray(inc.level_once_inr) ? inc.level_once_inr : [];
@@ -1844,23 +1993,63 @@ const server = Bun.serve({
 // ----------------------------------------------------------------------------
 // User Finance Handlers
 // ----------------------------------------------------------------------------
+const EARNED_INCOME_TYPES = [
+  "captcha_income",
+  "signup_bonus",
+  "fast_start_bonus",
+  "streak_bonus",
+  "level_once",
+  "level_daily",
+  "compounding_daily",
+  "compounding_maturity",
+  "offerwall_income",
+] as const;
+
 async function getUserTodayCaptchaState(userId: string) {
+  await ensureIncomeTables();
   const today = todayIst();
   const dailyKey = `cap_day:${today}:${userId}`;
-  const [profRows, pendingRaw, redisDayRaw] = await Promise.all([
+  const [profRows, pendingRaw, flushKeys, redisDayRaw] = await Promise.all([
     sql`select balance_usdt, total_captchas_solved, today_captchas_count, to_char((today_captchas_date)::date, 'YYYY-MM-DD') as db_day from public.profiles where id = ${userId} limit 1`,
     redis.hget("pending:captchas", userId),
+    redis.keys("pending:captchas:flush:*").catch(() => []),
     redis.get(dailyKey),
   ]);
   const prof = profRows[0] || { balance_usdt: 0, total_captchas_solved: 0, today_captchas_count: 0, db_day: "" };
-  const [pCnt, pUsdt] = (pendingRaw || "0:0").split(":").map(Number);
+  let [pCnt, pUsdt] = (pendingRaw || "0:0").split(":").map((x) => Number(x || 0));
+  if (flushKeys.length) {
+    const flushVals = await Promise.all(flushKeys.slice(0, 10).map((k) => redis.hget(k, userId).catch(() => null)));
+    for (const fv of flushVals) {
+      if (!fv) continue;
+      const [fc, fu] = fv.split(":").map((x) => Number(x || 0));
+      pCnt += fc;
+      pUsdt += fu;
+    }
+  }
   const dbToday = prof.db_day === today ? Number(prof.today_captchas_count || 0) : 0;
   const redisDay = Number(redisDayRaw || 0);
-  const todayPassed = Math.max(redisDay, dbToday + (pCnt || 0));
-  if (todayPassed > 0 && redisDay < todayPassed) {
+  const todayPassed = Math.max(0, dbToday + (pCnt || 0));
+  if (todayPassed > 0 && redisDay !== todayPassed) {
     await redis.set(dailyKey, String(todayPassed), "EX", 100_000);
+  } else if (todayPassed === 0 && redisDay > 0) {
+    await redis.del(dailyKey).catch(() => {});
   }
-  return { prof, pCnt: pCnt || 0, pUsdt: pUsdt || 0, todayPassed, dailyKey, dbToday };
+  return { prof, pCnt: pCnt || 0, pUsdt: Math.round((pUsdt || 0) * 10000) / 10000, todayPassed, dailyKey, dbToday };
+}
+
+function resolveCaptchaRewards(incSet: Record<string, any>): { rewardUsdt: number; rewardInr: number } {
+  const rawInr = Number(incSet?.captcha_reward_inr);
+  const rawUsdt = Number(incSet?.captcha_reward_usdt);
+  let rewardUsdt = Number.isFinite(rawUsdt) && rawUsdt > 0 ? Math.round(rawUsdt * 10000) / 10000 : 0;
+  let rewardInr = Number.isFinite(rawInr) && rawInr >= 0 ? Math.round(rawInr * 100) / 100 : Math.round(rewardUsdt * USDT_INR_RATE * 100) / 100;
+  if (rewardInr > 0 && rewardUsdt <= 0) {
+    rewardUsdt = Math.max(0.0001, Math.round((rewardInr / USDT_INR_RATE) * 10000) / 10000);
+  }
+  if (!Number.isFinite(rawInr) && !Number.isFinite(rawUsdt)) {
+    rewardUsdt = 0.01;
+    rewardInr = 1;
+  }
+  return { rewardUsdt, rewardInr };
 }
 
 async function handleUserFinance(action: string, body: Record<string, any>, user: { id: string; email?: string; role?: string }, req?: Request): Promise<Response> {
@@ -1871,8 +2060,7 @@ async function handleUserFinance(action: string, body: Record<string, any>, user
         getUserTodayCaptchaState(user.id),
       ]);
       const limit = Math.max(0, Number(incSet.captcha_daily_limit ?? 50));
-      const rewardUsdt = Math.max(0, Number(incSet.captcha_reward_usdt ?? 0.01));
-      const rewardInr = Math.round(rewardUsdt * USDT_INR_RATE * 100) / 100;
+      const { rewardUsdt, rewardInr } = resolveCaptchaRewards(incSet);
       if (state.todayPassed >= limit) {
         if (limit > 0) {
           const markKey = `cap_comp_mark:${todayIst()}:${user.id}`;
@@ -1911,8 +2099,7 @@ async function handleUserFinance(action: string, body: Record<string, any>, user
         getUserTodayCaptchaState(user.id),
       ]);
       const limit = Math.max(0, Number(incSet.captcha_daily_limit ?? 50));
-      const rewardUsdt = Math.max(0, Number(incSet.captcha_reward_usdt ?? 0.01));
-      const rewardInr = Math.round(rewardUsdt * USDT_INR_RATE * 100) / 100;
+      const { rewardUsdt, rewardInr } = resolveCaptchaRewards(incSet);
 
       if (state.todayPassed >= limit) {
         return jsonRes({
@@ -1922,6 +2109,7 @@ async function handleUserFinance(action: string, body: Record<string, any>, user
           today_passed: state.todayPassed,
           captcha_daily_limit: limit,
           reward_inr: rewardInr,
+          reward_usdt: rewardUsdt,
           next: null,
         });
       }
@@ -1931,20 +2119,15 @@ async function handleUserFinance(action: string, body: Record<string, any>, user
         return jsonRes({ ok: false, today_passed: state.todayPassed, captcha_daily_limit: limit, next });
       }
 
-      const incrVal = await redis.incr(state.dailyKey);
-      const newCount = Math.max(state.todayPassed + 1, incrVal);
-      if (newCount !== incrVal || newCount === 1) {
-        await redis.set(state.dailyKey, String(newCount), "EX", 100_000);
-      }
-
+      const today = todayIst();
       const incomeEnabled = incSet.income_enabled !== false;
       const companyCap = Math.max(0, Number(incSet.daily_company_cap_inr ?? 50000));
-      let withinCap = companyCap > 0;
-      if (incomeEnabled && withinCap && rewardUsdt > 0) {
-        const capCacheKey = `cache:spent_inr:${todayIst()}`;
+      let withinCap = true;
+      if (incomeEnabled && companyCap > 0 && rewardUsdt > 0) {
+        const capCacheKey = `cache:spent_inr:${today}`;
         let spentStr = await redis.get(capCacheKey);
         if (spentStr === null) {
-          const spentNow = await getSpentInrForDay(todayIst());
+          const spentNow = await getSpentInrForDay(today);
           await redis.set(capCacheKey, String(spentNow), "EX", 10);
           spentStr = String(spentNow);
         }
@@ -1952,17 +2135,54 @@ async function handleUserFinance(action: string, body: Record<string, any>, user
           withinCap = false;
         }
       }
-      const rewardPaid = incomeEnabled && withinCap && newCount <= limit && rewardUsdt > 0;
+
+      const expectedNewCount = state.todayPassed + 1;
+      const rewardPaid = incomeEnabled && withinCap && expectedNewCount <= limit && rewardUsdt > 0;
+
+      // Credit directly & atomically in PostgreSQL so Balance, Captcha Done, Breakdown & History update immediately
+      let newCount = expectedNewCount;
+      let creditedBalanceUsdt: number | null = null;
+      await sql.begin(async (tx: any) => {
+        if (rewardPaid) {
+          await tx`
+            insert into public.wallet_ledger (user_id, entry_type, amount, description)
+            values (${user.id}::uuid, 'captcha_income', ${rewardUsdt}, ${`Captcha reward (₹${rewardInr})`})
+          `;
+        }
+        const [updProf] = await tx`
+          update public.profiles p
+          set
+            total_captchas_solved = coalesce(p.total_captchas_solved, 0) + 1,
+            today_captchas_count = case
+              when p.today_captchas_date = ${today}::date then coalesce(p.today_captchas_count, 0) + 1
+              else 1
+            end,
+            today_captchas_date = ${today}::date,
+            balance_usdt = coalesce((
+              select round(sum(w.amount)::numeric, 4)
+              from public.wallet_ledger w
+              where w.user_id = p.id
+            ), 0)
+          where p.id = ${user.id}::uuid
+          returning today_captchas_count, balance_usdt
+        `;
+        if (updProf) {
+          newCount = Math.max(expectedNewCount, Number(updProf.today_captchas_count || 0) + state.pCnt);
+          creditedBalanceUsdt = Number(updProf.balance_usdt || 0);
+        }
+      });
+
+      await redis.set(state.dailyKey, String(newCount), "EX", 100_000);
       if (rewardPaid) {
-        await redis.eval(LUA_ADD_PENDING, 1, "pending:captchas", user.id, "1", String(rewardUsdt));
-        await redis.incrbyfloat(`cache:spent_inr:${todayIst()}`, rewardInr).catch(() => {});
+        await redis.incrbyfloat(`cache:spent_inr:${today}`, rewardInr).catch(() => {});
       }
+
       const limitReached = newCount >= limit;
       let levelUnlocked = false;
       let levelCreditedInr = 0;
       if (limitReached && limit > 0) {
         levelUnlocked = true;
-        const lvlRes = await processLevelIncomeForCompletion(user.id, todayIst(), { captchasDone: newCount }).catch(() => ({ credited_count: 0, credited_inr: 0 }));
+        const lvlRes = await processLevelIncomeForCompletion(user.id, today, { captchasDone: newCount }).catch(() => ({ credited_count: 0, credited_inr: 0 }));
         levelCreditedInr = lvlRes.credited_inr;
       }
       const next = limitReached ? null : await issueCaptchaChallenge(user.id);
@@ -1976,24 +2196,37 @@ async function handleUserFinance(action: string, body: Record<string, any>, user
         captcha_daily_limit: limit,
         reward_inr: rewardInr,
         reward_usdt: rewardUsdt,
+        balance_usdt: creditedBalanceUsdt,
         next,
       });
     }
 
     if (action === "wallet") {
-      const [capState, deposits, withdrawals, incSet, ledgerSums] = await Promise.all([
+      const today = todayIst();
+      const [capState, deposits, withdrawals, incSet, ledgerSums, [todayIncomeRow]] = await Promise.all([
         getUserTodayCaptchaState(user.id),
         sql`select * from public.deposits where user_id = ${user.id} order by created_at desc limit 20`,
         sql`select * from public.withdrawal_requests where user_id = ${user.id} order by created_at desc limit 20`,
         getCachedIncomeSettings(),
         sql`select entry_type, coalesce(sum(amount), 0) as total_usdt from public.wallet_ledger where user_id = ${user.id} group by entry_type`,
+        sql`
+          select coalesce(sum(amount), 0) as today_usdt
+          from public.wallet_ledger
+          where user_id = ${user.id}
+            and amount > 0
+            and entry_type = any(${Array.from(EARNED_INCOME_TYPES)})
+            and (created_at at time zone 'Asia/Kolkata')::date = ${today}::date
+        `,
       ]);
       const { prof, pCnt, pUsdt, todayPassed } = capState;
-      const totalUsdt = Number(prof.balance_usdt || 0) + pUsdt;
+      const ledgerBalanceUsdt = Math.round(ledgerSums.reduce((s: number, r: any) => s + Number(r.total_usdt || 0), 0) * 10000) / 10000;
+      if (Math.abs(ledgerBalanceUsdt - Number(prof.balance_usdt || 0)) > 0.0001) {
+        await sql`update public.profiles set balance_usdt = ${ledgerBalanceUsdt} where id = ${user.id}::uuid`.catch(() => {});
+      }
+      const totalUsdt = Math.round((ledgerBalanceUsdt + pUsdt) * 10000) / 10000;
       const depUsdt = deposits.filter((d: any) => d.status === "approved").reduce((s: number, d: any) => s + Number(d.amount_usdt || 0), 0);
-      const rewardUsdt = Number(incSet.captcha_reward_usdt ?? 0.01);
-      const rewardInr = Number(incSet.captcha_reward_inr ?? Math.round(rewardUsdt * USDT_INR_RATE * 100) / 100);
-      const limit = Number(incSet.captcha_daily_limit ?? 50);
+      const { rewardUsdt, rewardInr } = resolveCaptchaRewards(incSet);
+      const limit = Math.max(0, Number(incSet.captcha_daily_limit ?? 50));
 
       const incomeByType: Record<string, number> = {};
       for (const r of ledgerSums) {
@@ -2003,8 +2236,13 @@ async function handleUserFinance(action: string, body: Record<string, any>, user
         incomeByType.captcha_income = Math.round(((incomeByType.captcha_income || 0) + pUsdt * USDT_INR_RATE) * 100) / 100;
       }
 
+      const todayIncomeInr = Math.round((Number(todayIncomeRow?.today_usdt || 0) + pUsdt) * USDT_INR_RATE * 100) / 100;
+      const totalIncomeInr = Math.round(
+        EARNED_INCOME_TYPES.reduce((sum, key) => sum + Number(incomeByType[key] || 0), 0) * 100
+      ) / 100;
+
       return jsonRes({
-        balance_usdt: Math.round(totalUsdt * 10000) / 10000,
+        balance_usdt: totalUsdt,
         balance_inr: Math.round(totalUsdt * USDT_INR_RATE * 100) / 100,
         tasks_completed: Number(prof.total_captchas_solved || 0) + pCnt,
         today_passed: todayPassed,
@@ -2012,8 +2250,8 @@ async function handleUserFinance(action: string, body: Record<string, any>, user
         captcha_reward_usdt: rewardUsdt,
         captcha_reward_inr: rewardInr,
         income_by_type: incomeByType,
-        today_income_inr: Math.round(todayPassed * rewardUsdt * USDT_INR_RATE * 100) / 100,
-        total_income_inr: Math.round(totalUsdt * USDT_INR_RATE * 100) / 100,
+        today_income_inr: todayIncomeInr,
+        total_income_inr: totalIncomeInr,
         deposited_usdt: Math.round(depUsdt * 100) / 100,
         available_deposit_usdt: Math.round(depUsdt * 100) / 100,
         deposits,
@@ -2114,14 +2352,14 @@ async function handleUserFinance(action: string, body: Record<string, any>, user
     }
 
     if (action === "compounding_info") {
-      const [settings, plans, [prof], pendingRaw] = await Promise.all([
+      const [settings, plans, [ledgerRow], pendingRaw] = await Promise.all([
         getCachedCompoundingSettings(),
         sql`select * from public.compounding_plans where user_id = ${user.id} order by id desc`,
-        sql`select balance_usdt from public.profiles where id = ${user.id} limit 1`,
+        sql`select coalesce(sum(amount), 0) as total_usdt from public.wallet_ledger where user_id = ${user.id}`,
         redis.hget("pending:captchas", user.id),
       ]);
       const pUsdt = pendingRaw ? Number(pendingRaw.split(":")[1] || 0) : 0;
-      const walletUsdt = Number(prof?.balance_usdt || 0) + pUsdt;
+      const walletUsdt = Number(ledgerRow?.total_usdt || 0) + pUsdt;
       return jsonRes({
         settings,
         plans,
@@ -2372,6 +2610,7 @@ async function handleAdminControl(
         compounding_plans,
         capState,
         incSet,
+        [ledgerSumRow],
       ] = await Promise.all([
         sql`
           select p.id, p.member_id, p.email, p.full_name, p.phone, p.gender,
@@ -2401,17 +2640,23 @@ async function handleAdminControl(
         sql`select * from public.compounding_plans where user_id = ${uid} order by id desc limit 20`,
         getUserTodayCaptchaState(uid),
         getCachedIncomeSettings(),
+        sql`select coalesce(sum(amount), 0) as total_usdt from public.wallet_ledger where user_id = ${uid}`,
       ]);
       if (!profile) return jsonRes({ error: "User profile not found." }, 404);
+      const ledgerUsdt = Math.round(Number(ledgerSumRow?.total_usdt || 0) * 10000) / 10000;
+      if (Math.abs(ledgerUsdt - Number(profile.balance_usdt || 0)) > 0.0001) {
+        await sql`update public.profiles set balance_usdt = ${ledgerUsdt} where id = ${uid}`.catch(() => {});
+      }
       return jsonRes({
         profile: {
           ...profile,
+          balance_usdt: ledgerUsdt,
           live_today_captchas: capState?.todayPassed ?? Number(profile.today_captchas_count || 0),
           daily_captcha_limit: Math.max(0, Number(incSet?.captcha_daily_limit ?? 50)),
         },
         user_security: uSec || { role: "user", pin_set: false, totp_enabled: false, token_version: 1 },
         direct_referrals_count: Number(directRow?.cnt || 0),
-        wallet_balance: Number(profile?.balance_usdt || 0),
+        wallet_balance: ledgerUsdt + (capState?.pUsdt || 0),
         ledger,
         withdrawals,
         deposits,
