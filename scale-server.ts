@@ -1783,7 +1783,7 @@ async function routeRequest(req: Request): Promise<Response> {
     if (path === "/health" || path === "/") {
       try {
         await Promise.all([sql`select 1`, redis.ping()]);
-        return jsonRes({ ok: true, status: "healthy", mode: "hetzner-standalone", version: "2026-11-27-ui-wd-success-v4" }, 200, req);
+        return jsonRes({ ok: true, status: "healthy", mode: "hetzner-standalone", version: "2026-11-27-ui-wd-success-v5" }, 200, req);
       } catch (e: any) {
         return jsonRes({ ok: false, error: e?.message || "unhealthy" }, 503, req);
       }
@@ -2281,7 +2281,7 @@ async function handleUserFinance(action: string, body: Record<string, any>, user
 
     if (action === "wallet") {
       const today = todayIst();
-      const [capState, deposits, withdrawals, incSet, wdRule, ledgerSums, [todayIncomeRow]] = await Promise.all([
+      const [capState, deposits, withdrawals, incSet, wdRule, ledgerSums, [todayIncomeRow], [depAggRow], [wdAggRow]] = await Promise.all([
         getUserTodayCaptchaState(user.id),
         sql`select * from public.deposits where user_id = ${user.id} order by created_at desc limit 20`,
         sql`select * from public.withdrawal_requests where user_id = ${user.id} order by created_at desc limit 20`,
@@ -2296,6 +2296,16 @@ async function handleUserFinance(action: string, body: Record<string, any>, user
             and entry_type = any(${Array.from(EARNED_INCOME_TYPES)})
             and (created_at at time zone 'Asia/Kolkata')::date = ${today}::date
         `,
+        sql`
+          select coalesce(sum(amount_usdt), 0) as total_dep_usdt
+          from public.deposits
+          where user_id = ${user.id} and status = 'approved'
+        `,
+        sql`
+          select coalesce(sum(amount), 0) as total_wd_usdt
+          from public.withdrawal_requests
+          where user_id = ${user.id} and status = 'approved'
+        `,
       ]);
       const { prof, pCnt, pUsdt, todayPassed } = capState;
       const ledgerBalanceUsdt = Math.round(ledgerSums.reduce((s: number, r: any) => s + Number(r.total_usdt || 0), 0) * 10000) / 10000;
@@ -2303,7 +2313,8 @@ async function handleUserFinance(action: string, body: Record<string, any>, user
         await sql`update public.profiles set balance_usdt = ${ledgerBalanceUsdt} where id = ${user.id}::uuid`.catch(() => {});
       }
       const totalUsdt = Math.round((ledgerBalanceUsdt + pUsdt) * 10000) / 10000;
-      const depUsdt = deposits.filter((d: any) => d.status === "approved").reduce((s: number, d: any) => s + Number(d.amount_usdt || 0), 0);
+      const depUsdt = Number(depAggRow?.total_dep_usdt ?? deposits.filter((d: any) => d.status === "approved").reduce((s: number, d: any) => s + Number(d.amount_usdt || 0), 0));
+      const approvedWdUsdt = Number(wdAggRow?.total_wd_usdt ?? withdrawals.filter((w: any) => w.status === "approved").reduce((s: number, w: any) => s + Number(w.amount || 0), 0));
       const { rewardUsdt, rewardInr } = resolveCaptchaRewards(incSet);
       const limit = Math.max(0, Number(incSet.captcha_daily_limit ?? 50));
 
@@ -2320,7 +2331,10 @@ async function handleUserFinance(action: string, body: Record<string, any>, user
         EARNED_INCOME_TYPES.reduce((sum, key) => sum + Number(incomeByType[key] || 0), 0) * 100
       ) / 100;
 
-      const pendingWithCond = withdrawals.find((w: any) => w.status === "pending" && Number(w.required_deposit_usdt || 0) > 0) || null;
+      const ruleOn = Boolean(wdRule?.enabled);
+      const pendingWithCond = ruleOn
+        ? (withdrawals.find((w: any) => w.status === "pending" && Number(w.required_deposit_usdt || 0) > 0) || null)
+        : null;
 
       return jsonRes({
         balance_usdt: totalUsdt,
@@ -2333,6 +2347,8 @@ async function handleUserFinance(action: string, body: Record<string, any>, user
         income_by_type: incomeByType,
         today_income_inr: todayIncomeInr,
         total_income_inr: totalIncomeInr,
+        total_deposited_inr: Math.round(depUsdt * USDT_INR_RATE * 100) / 100,
+        total_approved_withdrawals_inr: Math.round(approvedWdUsdt * USDT_INR_RATE * 100) / 100,
         deposited_usdt: Math.round(depUsdt * 100) / 100,
         available_deposit_usdt: Math.round(depUsdt * 100) / 100,
         withdraw_rule: wdRule,
