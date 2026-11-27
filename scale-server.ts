@@ -594,6 +594,22 @@ async function getCachedWithdrawConfig() {
   );
 }
 
+async function getCachedWithdrawRule(): Promise<{ enabled: boolean; min_deposit_usdt: number }> {
+  const row = await getCachedConfigRow(
+    "cache:withdraw_rule",
+    async () => {
+      await sql`insert into public.platform_settings (id) values (1) on conflict (id) do nothing`;
+      return await sql`select withdraw_rule_json from public.platform_settings where id = 1`;
+    },
+    { withdraw_rule_json: {} }
+  );
+  const r = row?.withdraw_rule_json || {};
+  return {
+    enabled: Boolean(r.enabled),
+    min_deposit_usdt: Math.max(0, Number(r.min_deposit_usdt || 0)),
+  };
+}
+
 async function getCachedAppSettings() {
   return await getCachedConfigRow(
     "cache:app_settings",
@@ -1767,7 +1783,7 @@ async function routeRequest(req: Request): Promise<Response> {
     if (path === "/health" || path === "/") {
       try {
         await Promise.all([sql`select 1`, redis.ping()]);
-        return jsonRes({ ok: true, status: "healthy", mode: "hetzner-standalone", version: "2026-11-26-instant-credit-v2" }, 200, req);
+        return jsonRes({ ok: true, status: "healthy", mode: "hetzner-standalone", version: "2026-11-27-admin-withdraw-fix-v3" }, 200, req);
       } catch (e: any) {
         return jsonRes({ ok: false, error: e?.message || "unhealthy" }, 503, req);
       }
@@ -1861,7 +1877,8 @@ async function routeRequest(req: Request): Promise<Response> {
     if (path.startsWith("/api/table/")) {
       const table = path.replace("/api/table/", "");
       if (table === "public_withdraw_config") {
-        return jsonRes({ data: await getCachedWithdrawConfig() });
+        const [wdCfg, rule] = await Promise.all([getCachedWithdrawConfig(), getCachedWithdrawRule()]);
+        return jsonRes({ data: wdCfg ? { ...wdCfg, withdraw_rule: rule } : { amounts: [], chart: {}, amount_conditions: [], withdraw_rule: rule } });
       }
       if (table === "compounding_settings") {
         return jsonRes({ data: await getCachedCompoundingSettings() });
@@ -2264,11 +2281,12 @@ async function handleUserFinance(action: string, body: Record<string, any>, user
 
     if (action === "wallet") {
       const today = todayIst();
-      const [capState, deposits, withdrawals, incSet, ledgerSums, [todayIncomeRow]] = await Promise.all([
+      const [capState, deposits, withdrawals, incSet, wdRule, ledgerSums, [todayIncomeRow]] = await Promise.all([
         getUserTodayCaptchaState(user.id),
         sql`select * from public.deposits where user_id = ${user.id} order by created_at desc limit 20`,
         sql`select * from public.withdrawal_requests where user_id = ${user.id} order by created_at desc limit 20`,
         getCachedIncomeSettings(),
+        getCachedWithdrawRule(),
         sql`select entry_type, coalesce(sum(amount), 0) as total_usdt from public.wallet_ledger where user_id = ${user.id} group by entry_type`,
         sql`
           select coalesce(sum(amount), 0) as today_usdt
@@ -2302,6 +2320,8 @@ async function handleUserFinance(action: string, body: Record<string, any>, user
         EARNED_INCOME_TYPES.reduce((sum, key) => sum + Number(incomeByType[key] || 0), 0) * 100
       ) / 100;
 
+      const pendingWithCond = withdrawals.find((w: any) => w.status === "pending" && Number(w.required_deposit_usdt || 0) > 0) || null;
+
       return jsonRes({
         balance_usdt: totalUsdt,
         balance_inr: Math.round(totalUsdt * USDT_INR_RATE * 100) / 100,
@@ -2315,9 +2335,10 @@ async function handleUserFinance(action: string, body: Record<string, any>, user
         total_income_inr: totalIncomeInr,
         deposited_usdt: Math.round(depUsdt * 100) / 100,
         available_deposit_usdt: Math.round(depUsdt * 100) / 100,
+        withdraw_rule: wdRule,
         deposits,
         withdrawals,
-        pending_condition: withdrawals.find((w: any) => w.status === "pending") || null,
+        pending_condition: pendingWithCond,
       });
     }
 
@@ -2375,26 +2396,31 @@ async function handleUserFinance(action: string, body: Record<string, any>, user
         return jsonRes({ error: "Cloudflare human verification failed. Please verify again." }, 400);
       }
 
-      const [wdCfg, [pSet], depRows, todayWdRows] = await Promise.all([
+      const [wdCfg, rule, depRows, todayWdRows] = await Promise.all([
         getCachedWithdrawConfig(),
-        sql`select withdraw_rule_json from public.platform_settings where id = 1`,
+        getCachedWithdrawRule(),
         sql`select coalesce(sum(amount_usdt), 0) as total from public.deposits where user_id = ${user.id} and status = 'approved'`,
         sql`select count(*)::integer as cnt from public.withdrawal_requests where user_id = ${user.id} and (created_at at time zone 'Asia/Kolkata')::date = (now() at time zone 'Asia/Kolkata')::date`,
       ]);
       const depUsdt = Number(depRows[0]?.total || 0);
-      const rule = pSet?.withdraw_rule_json || {};
-      if (rule.enabled && depUsdt < Number(rule.min_deposit_usdt || 0)) {
-        return jsonRes({ error: `Minimum ${Number(rule.min_deposit_usdt)} USDT approved deposit required before withdrawal.` }, 400);
-      }
       const chart = wdCfg?.chart && !Array.isArray(wdCfg.chart) ? wdCfg.chart : {};
       const dailyLimit = Number(chart.daily_limit ?? 2);
       if (dailyLimit > 0 && Number(todayWdRows[0]?.cnt || 0) >= dailyLimit) {
         return jsonRes({ error: `Daily withdrawal limit reached (${dailyLimit}/day).` }, 400);
       }
-      const reqPct = Number(chart.deposit_percent ?? 40);
-      const reqDep = Math.round(amt * (reqPct / 100) * 100) / 100;
-      if (reqDep > 0 && depUsdt < reqDep) {
-        return jsonRes({ error: `Deposit ${reqDep.toFixed(2)} USDT (${reqPct}%) required to withdraw ${amt} USDT.` }, 400);
+
+      let reqDep = 0;
+      if (rule.enabled) {
+        if (rule.min_deposit_usdt > 0 && depUsdt < rule.min_deposit_usdt) {
+          return jsonRes({ error: `Minimum ${rule.min_deposit_usdt} USDT approved deposit required before withdrawal.` }, 400);
+        }
+        const amtConds = Array.isArray(wdCfg?.amount_conditions) ? wdCfg.amount_conditions : [];
+        const matched = amtConds.find((c: any) => Number(c?.amount) === amt);
+        const reqPct = Math.max(0, Number(chart.deposit_percent ?? 40));
+        reqDep = matched ? Math.max(0, Number(matched.deposit || 0)) : Math.round(amt * (reqPct / 100) * 100) / 100;
+        if (reqDep > 0 && depUsdt < reqDep) {
+          return jsonRes({ error: `Deposit ${reqDep.toFixed(2)} USDT required to withdraw ${amt} USDT.` }, 400);
+        }
       }
 
       await sql.begin(async (tx: any) => {
@@ -3093,13 +3119,33 @@ async function handleAdminControl(
     if (action === "list_withdrawals") {
       const st = String(body.status || "all");
       const withdrawals = st === "all"
-        ? await sql`select * from public.withdrawal_requests order by id desc limit 100`
-        : await sql`select * from public.withdrawal_requests where status = ${st} order by id desc limit 100`;
+        ? await sql`
+            select w.*, coalesce(p.member_id, '') as member_id, coalesce(p.full_name, '') as full_name, coalesce(p.email, '') as email
+            from public.withdrawal_requests w
+            left join public.profiles p on p.id = w.user_id
+            order by w.id desc limit 100
+          `
+        : await sql`
+            select w.*, coalesce(p.member_id, '') as member_id, coalesce(p.full_name, '') as full_name, coalesce(p.email, '') as email
+            from public.withdrawal_requests w
+            left join public.profiles p on p.id = w.user_id
+            where w.status = ${st}
+            order by w.id desc limit 100
+          `;
       return jsonRes({ withdrawals });
     }
     if (action === "set_withdrawal_condition") {
-      await sql`update public.withdrawal_requests set required_deposit_usdt = ${Number(body.required_deposit_usdt || 0)} where id = ${Number(body.withdrawal_id)}`;
-      return jsonRes({ message: "Condition updated." });
+      const wid = Number(body.withdrawal_id);
+      if (!Number.isFinite(wid) || wid <= 0) return jsonRes({ error: "Invalid withdrawal ID." }, 400);
+      const reqDep = Math.max(0, Number(body.required_deposit_usdt || 0));
+      const [upd] = await sql`
+        update public.withdrawal_requests
+        set required_deposit_usdt = ${reqDep}
+        where id = ${wid}
+        returning id
+      `;
+      if (!upd) return jsonRes({ error: "Withdrawal request not found." }, 404);
+      return jsonRes({ message: reqDep > 0 ? `Deposit condition set to ${reqDep} USDT.` : "Deposit condition turned OFF (0 USDT)." });
     }
     if (action === "settle_withdrawal") {
       const wid = Number(body.withdrawal_id);
@@ -3129,12 +3175,15 @@ async function handleAdminControl(
 
     if (action === "list_deposits") {
       const st = String(body.status || "all");
-      const uid = String(body.user_id || "").trim();
+      const rawUid = String(body.user_id || "").trim();
+      const uid = rawUid ? await resolveAdminTargetUid(rawUid) : "";
       const deposits = await sql`
-        select * from public.deposits
-        where (${st === "all"} or status = ${st})
-          and (${!UUID_RE.test(uid)} or user_id = ${UUID_RE.test(uid) ? uid : "00000000-0000-0000-0000-000000000000"}::uuid)
-        order by id desc limit 100
+        select d.*, coalesce(p.member_id, '') as member_id, coalesce(p.full_name, '') as full_name, coalesce(p.email, '') as email
+        from public.deposits d
+        left join public.profiles p on p.id = d.user_id
+        where (${st === "all"} or d.status = ${st})
+          and (${!uid} or d.user_id = ${uid || "00000000-0000-0000-0000-000000000000"}::uuid)
+        order by d.id desc limit 100
       `;
       return jsonRes({
         deposits: deposits.map((d: any) => ({
@@ -3316,18 +3365,56 @@ async function handleAdminControl(
       return jsonRes({ message: "Withdraw chart updated." });
     }
     if (action === "get_withdraw_rule") {
-      const [p] = await sql`select withdraw_rule_json from public.platform_settings where id = 1`;
-      const r = p?.withdraw_rule_json || {};
-      return jsonRes({ enabled: Boolean(r.enabled), min_deposit_usdt: Number(r.min_deposit_usdt || 0), rule: r });
+      const [rule, wdCfg] = await Promise.all([getCachedWithdrawRule(), getCachedWithdrawConfig()]);
+      const chart = wdCfg?.chart && !Array.isArray(wdCfg.chart) ? wdCfg.chart : {};
+      return jsonRes({
+        enabled: rule.enabled,
+        min_deposit_usdt: rule.min_deposit_usdt,
+        deposit_percent: Number(chart.deposit_percent ?? 40),
+        rule,
+      });
     }
     if (action === "set_withdraw_rule") {
-      const r = body.rule || { enabled: Boolean(body.enabled), min_deposit_usdt: Number(body.min_deposit_usdt || 0) };
+      const rawRule = body.rule || {
+        enabled: Boolean(body.enabled),
+        min_deposit_usdt: Math.max(0, Number(body.min_deposit_usdt || 0)),
+      };
+      const r = {
+        enabled: Boolean(rawRule.enabled),
+        min_deposit_usdt: Math.max(0, Number(rawRule.min_deposit_usdt || 0)),
+      };
       await sql`
         insert into public.platform_settings (id, withdraw_rule_json, updated_at)
         values (1, ${JSON.stringify(r)}::jsonb, now())
         on conflict (id) do update set withdraw_rule_json = excluded.withdraw_rule_json, updated_at = now()
       `;
-      return jsonRes({ message: "Withdrawal rules updated." });
+      if (body.deposit_percent !== undefined && Number.isFinite(Number(body.deposit_percent))) {
+        const pct = Math.max(0, Math.min(100, Number(body.deposit_percent)));
+        const [cur] = await sql`select chart from public.public_withdraw_config where id = 1`;
+        const curChart = cur?.chart && !Array.isArray(cur.chart) ? cur.chart : {};
+        const nextChart = {
+          deposit_percent: pct,
+          net_percent: Number(curChart.net_percent ?? 60),
+          daily_limit: Number(curChart.daily_limit ?? 2),
+          processing: String(curChart.processing || "1 - 12 Hours (Estimated)"),
+        };
+        await sql`
+          insert into public.public_withdraw_config (id, chart, updated_at)
+          values (1, ${JSON.stringify(nextChart)}::jsonb, now())
+          on conflict (id) do update set chart = excluded.chart, updated_at = now()
+        `;
+      }
+      await Promise.all([
+        redis.del("cache:withdraw_rule"),
+        redis.del("cache:public_withdraw_config"),
+      ]);
+      return jsonRes({
+        enabled: r.enabled,
+        min_deposit_usdt: r.min_deposit_usdt,
+        message: r.enabled
+          ? `Withdrawal Deposit Condition is ON (Min ${r.min_deposit_usdt} USDT).`
+          : "Withdrawal Deposit Condition is OFF (Users can withdraw without deposit).",
+      });
     }
 
     if (action === "get_income_settings") {
