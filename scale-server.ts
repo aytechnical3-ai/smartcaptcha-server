@@ -1783,7 +1783,7 @@ async function routeRequest(req: Request): Promise<Response> {
     if (path === "/health" || path === "/") {
       try {
         await Promise.all([sql`select 1`, redis.ping()]);
-        return jsonRes({ ok: true, status: "healthy", mode: "hetzner-standalone", version: "2026-11-27-admin-withdraw-fix-v3" }, 200, req);
+        return jsonRes({ ok: true, status: "healthy", mode: "hetzner-standalone", version: "2026-11-27-ui-wd-success-v4" }, 200, req);
       } catch (e: any) {
         return jsonRes({ ok: false, error: e?.message || "unhealthy" }, 503, req);
       }
@@ -2354,17 +2354,99 @@ async function handleUserFinance(action: string, body: Record<string, any>, user
         types = ["captcha_income", "signup_bonus", "fast_start_bonus", "streak_bonus", "level_once", "level_daily", "compounding_daily", "compounding_maturity", "offerwall_income"];
       }
 
-      const rows = await sql`
-        select * from public.wallet_ledger
-        where user_id = ${user.id}
-          ${before ? sql`and created_at < ${before}` : sql``}
-          ${types ? sql`and entry_type = any(${types})` : sql``}
-        order by created_at desc limit ${limit + 1}
-      `;
+      const [rows, wdList, depList, ledgerSums] = await Promise.all([
+        sql`
+          select * from public.wallet_ledger
+          where user_id = ${user.id}
+            ${before ? sql`and created_at < ${before}` : sql``}
+            ${types ? sql`and entry_type = any(${types})` : sql``}
+          order by created_at desc limit ${limit + 1}
+        `,
+        sql`
+          select id, amount, payout_method, payout_details_masked, status, tx_id, admin_note, created_at, settled_at
+          from public.withdrawal_requests
+          where user_id = ${user.id}
+          order by id desc limit 100
+        `,
+        sql`
+          select id, amount_usdt, tx_id, status, created_at, settled_at
+          from public.deposits
+          where user_id = ${user.id}
+          order by id desc limit 100
+        `,
+        sql`select entry_type, coalesce(sum(amount), 0) as total_usdt from public.wallet_ledger where user_id = ${user.id} group by entry_type`,
+      ]);
       const hasMore = rows.length > limit;
       const page = hasMore ? rows.slice(0, limit) : rows;
+
+      // Match withdrawal_reserve ledger rows 1-to-1 with withdrawal_requests so approved/pending/rejected & TX ID show accurately
+      const availableWds = [...wdList];
+      const matchWithdrawalForLedger = (row: any) => {
+        if (row.entry_type !== "withdrawal_reserve") return null;
+        const targetAmt = Math.abs(Number(row.amount || 0));
+        const rowTs = new Date(row.created_at).getTime();
+        let bestIdx = -1;
+        let bestDiff = Infinity;
+        for (let i = 0; i < availableWds.length; i++) {
+          const w = availableWds[i];
+          if (Math.abs(Number(w.amount || 0) - targetAmt) > 0.0005) continue;
+          const diff = Math.abs(new Date(w.created_at).getTime() - rowTs);
+          if (diff < bestDiff && diff <= 300_000) {
+            bestDiff = diff;
+            bestIdx = i;
+          }
+        }
+        if (bestIdx >= 0) {
+          const [picked] = availableWds.splice(bestIdx, 1);
+          return picked;
+        }
+        const descMatch = String(row.description || "").match(/#(\d+)/);
+        if (descMatch) {
+          const wid = Number(descMatch[1]);
+          const byId = wdList.find((w: any) => Number(w.id) === wid);
+          if (byId) return byId;
+        }
+        return null;
+      };
+
+      const entries = page.map((r: any) => {
+        const mw = matchWithdrawalForLedger(r);
+        let depMatch: any = null;
+        if (r.entry_type === "deposit_credit") {
+          const mId = String(r.description || "").match(/#(\d+)/);
+          if (mId) depMatch = depList.find((d: any) => Number(d.id) === Number(mId[1])) || null;
+        }
+        return {
+          ...r,
+          amount_inr: Math.round(Number(r.amount) * USDT_INR_RATE * 100) / 100,
+          wd_id: mw ? Number(mw.id) : null,
+          wd_status: mw ? String(mw.status) : null,
+          tx_id: mw?.tx_id || depMatch?.tx_id || null,
+          admin_note: mw?.admin_note || null,
+          payout_method: mw?.payout_method || null,
+          payout_details_masked: mw?.payout_details_masked || null,
+          settled_at: mw?.settled_at || depMatch?.settled_at || null,
+        };
+      });
+
+      const byType: Record<string, number> = {};
+      for (const s of ledgerSums) byType[String(s.entry_type)] = Number(s.total_usdt || 0);
+      const totalIncomeUsdt = EARNED_INCOME_TYPES.reduce((sum, k) => sum + Number(byType[k] || 0), 0);
+      const totalDepositUsdt = depList.filter((d: any) => d.status === "approved").reduce((sum, d: any) => sum + Number(d.amount_usdt || 0), 0);
+      const approvedWds = wdList.filter((w: any) => w.status === "approved");
+      const pendingWds = wdList.filter((w: any) => w.status === "pending");
+      const totalWithdrawnUsdt = approvedWds.reduce((sum, w: any) => sum + Number(w.amount || 0), 0);
+
       return jsonRes({
-        entries: page.map((r: any) => ({ ...r, amount_inr: Math.round(Number(r.amount) * USDT_INR_RATE * 100) / 100 })),
+        entries,
+        withdrawals: wdList,
+        summary: {
+          total_income_inr: Math.round(totalIncomeUsdt * USDT_INR_RATE * 100) / 100,
+          total_deposit_inr: Math.round(totalDepositUsdt * USDT_INR_RATE * 100) / 100,
+          total_withdrawn_inr: Math.round(totalWithdrawnUsdt * USDT_INR_RATE * 100) / 100,
+          approved_withdrawals_count: approvedWds.length,
+          pending_withdrawals_count: pendingWds.length,
+        },
         next_before: page.length ? page[page.length - 1].created_at : null,
         has_more: hasMore,
       });
@@ -3161,16 +3243,34 @@ async function handleAdminControl(
           returning *
         `;
         if (!w) return null;
-        if (dec === "rejected") {
+        const [reserveRow] = await tx`
+          select id from public.wallet_ledger
+          where user_id = ${w.user_id}
+            and entry_type = 'withdrawal_reserve'
+            and abs(abs(amount) - ${Number(w.amount)}) < 0.0005
+            and description not like 'Withdrawal Success #%'
+            and description not like 'Withdrawal #% Rejected%'
+          order by abs(extract(epoch from (created_at - ${w.created_at}::timestamptz))) asc, id desc
+          limit 1
+        `;
+        if (dec === "approved") {
+          if (reserveRow) {
+            const desc = `Withdrawal Success #${wid}${txId ? ` (TX: ${txId})` : ""} to ${w.payout_details_masked || "BEP-20"}`;
+            await tx`update public.wallet_ledger set description = ${desc} where id = ${reserveRow.id}`;
+          }
+        } else if (dec === "rejected") {
+          if (reserveRow) {
+            await tx`update public.wallet_ledger set description = ${`Withdrawal #${wid} Rejected & Refunded`} where id = ${reserveRow.id}`;
+          }
           await tx`
             insert into public.wallet_ledger (user_id, entry_type, amount, description)
-            values (${w.user_id}, 'withdrawal_refund', ${w.amount}, ${`Withdrawal #${wid} rejected: ${note}`})
+            values (${w.user_id}, 'withdrawal_refund', ${w.amount}, ${`Withdrawal #${wid} rejected: ${note || "Refunded to wallet"}`})
           `;
         }
         return w;
       });
       if (!settled) return jsonRes({ error: "Pending withdrawal not found." }, 404);
-      return jsonRes({ message: `Withdrawal #${wid} ${dec}.` });
+      return jsonRes({ message: `Withdrawal #${wid} ${dec === "approved" ? "approved (Success)" : "rejected"}.` });
     }
 
     if (action === "list_deposits") {
