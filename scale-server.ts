@@ -1752,19 +1752,54 @@ async function handleAuth(pathname: string, req: Request): Promise<Response> {
   if (pathname === "/api/auth/update-user" && req.method === "POST") {
     const user = await authenticateRequest(req);
     if (!user) return jsonRes({ error: "Login required." }, 401, req);
+    if (!(await checkRateLimit(`rl:upd:${user.id}`, 12, 300))) {
+      return jsonRes({ error: "Too many account update attempts. Please wait a few minutes." }, 429, req);
+    }
     const body: any = await req.json().catch(() => ({}));
-    if (body.password) {
-      if (String(body.password).length < 8) return jsonRes({ error: "Password must be at least 8 characters." }, 400, req);
-      await sql`update public.users set password_hash = ${await hashPassword(String(body.password))} where id = ${user.id}`;
-      await bumpTokenVersion(user.id);
+    let updatedEmail = user.email;
+    let rotated = false;
+
+    if (body.password !== undefined) {
+      const nextPwd = String(body.password || "");
+      if (nextPwd.length < 8 || nextPwd.length > 128) {
+        return jsonRes({ error: "Password must be 8 to 128 characters." }, 400, req);
+      }
+      await sql`update public.users set password_hash = ${await hashPassword(nextPwd)} where id = ${user.id}`;
+      rotated = true;
       logSecurityEvent("password_changed", ip, { userId: user.id, email: user.email, deviceFp: hdrDfp, details: "User updated password" });
     }
-    if (body.email) {
-      const nextEmail = String(body.email).trim().toLowerCase();
-      await sql`update public.users set email = ${nextEmail} where id = ${user.id}`;
-      await sql`update public.profiles set email = ${nextEmail} where id = ${user.id}`;
+
+    if (body.email !== undefined) {
+      const nextEmail = String(body.email || "").trim().toLowerCase();
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(nextEmail) || nextEmail.length > 160) {
+        return jsonRes({ error: "Invalid email or mobile login ID." }, 400, req);
+      }
+      if (ADMIN_EMAILS.has(nextEmail) && nextEmail !== user.email.toLowerCase()) {
+        logSecurityEvent("blocked_admin_email_claim", ip, { userId: user.id, email: user.email, deviceFp: hdrDfp, details: `Attempted to bind reserved email ${nextEmail}` });
+        return jsonRes({ error: "This email address is reserved." }, 403, req);
+      }
+      if (nextEmail !== user.email.toLowerCase()) {
+        const dup = await sql`select id from public.users where lower(email) = ${nextEmail} and id <> ${user.id} limit 1`;
+        if (dup.length) {
+          return jsonRes({ error: "This email or mobile ID is already registered." }, 409, req);
+        }
+        await sql.begin(async (tx: any) => {
+          await tx`update public.users set email = ${nextEmail} where id = ${user.id}`;
+          await tx`update public.profiles set email = ${nextEmail} where id = ${user.id}`;
+        });
+        updatedEmail = nextEmail;
+        rotated = true;
+        logSecurityEvent("email_changed", ip, { userId: user.id, email: nextEmail, deviceFp: hdrDfp, details: "User updated login email/mobile ID" });
+      }
     }
-    return jsonRes({ user }, 200, req);
+
+    if (rotated) {
+      const nextTv = await bumpTokenVersion(user.id);
+      const nextUser = { ...user, email: updatedEmail };
+      const access_token = await issueJwt(nextUser, hdrDfp, nextTv);
+      return jsonRes({ user: nextUser, access_token }, 200, req);
+    }
+    return jsonRes({ user: { ...user, email: updatedEmail } }, 200, req);
   }
 
   return jsonRes({ error: "Unknown auth endpoint" }, 404, req);
@@ -1787,7 +1822,7 @@ async function routeRequest(req: Request): Promise<Response> {
     if (path === "/health" || path === "/") {
       try {
         await Promise.all([sql`select 1`, redis.ping()]);
-        return jsonRes({ ok: true, status: "healthy", mode: "hetzner-standalone", version: "2026-11-28-ads-safe-v6" }, 200, req);
+        return jsonRes({ ok: true, status: "healthy", mode: "hetzner-standalone", version: "2026-11-28-sec-hardened-v7" }, 200, req);
       } catch (e: any) {
         return jsonRes({ ok: false, error: e?.message || "unhealthy" }, 503, req);
       }
@@ -1809,7 +1844,7 @@ async function routeRequest(req: Request): Promise<Response> {
     // Public RPCs
     if (path === "/api/rpc/public_registration_count") {
       const cnt = await getFastRowCount("profiles", "cache:reg_count", 30);
-      return jsonRes({ data: cnt });
+      return jsonRes({ data: cnt }, 200, req);
     }
 
     if (path === "/api/postback/offerwall") {
@@ -1833,19 +1868,19 @@ async function routeRequest(req: Request): Promise<Response> {
 
         const [cfg] = await sql`select postback_secret, user_share_pct, offerwall_enabled from public.monetization_settings where id = 1`;
         if (!cfg || !constantTimeEqual(secret, String(cfg.postback_secret || ""))) {
-          return jsonRes({ error: "Invalid postback secret." }, 403);
+          return jsonRes({ error: "Invalid postback secret." }, 403, req);
         }
         if (!cfg.offerwall_enabled) {
-          return jsonRes({ error: "Offerwall is currently disabled by Admin." }, 403);
+          return jsonRes({ error: "Offerwall is currently disabled by Admin." }, 403, req);
         }
         const incCfg = await getCachedIncomeSettings();
         if (incCfg.income_enabled === false) {
-          return jsonRes({ error: "Income payouts are currently paused by Admin." }, 403);
+          return jsonRes({ error: "Income payouts are currently paused by Admin." }, 403, req);
         }
-        if (!UUID_RE.test(userId)) return jsonRes({ error: "Invalid user_id." }, 400);
-        if (!txId) return jsonRes({ error: "tx_id is required." }, 400);
+        if (!UUID_RE.test(userId)) return jsonRes({ error: "Invalid user_id." }, 400, req);
+        if (!txId) return jsonRes({ error: "tx_id is required." }, 400, req);
         if (!Number.isFinite(payoutRaw) || payoutRaw <= 0 || payoutRaw > 5000) {
-          return jsonRes({ error: "Invalid payout amount." }, 400);
+          return jsonRes({ error: "Invalid payout amount." }, 400, req);
         }
 
         const sharePct = Math.min(95, Math.max(1, Number(cfg.user_share_pct || 60)));
@@ -1871,9 +1906,9 @@ async function routeRequest(req: Request): Promise<Response> {
           }
           return true;
         });
-        return jsonRes({ ok: true, status: credited ? "credited" : "duplicate", tx_id: txId, user_share_usdt: userShareUsdt, admin_profit_usdt: adminProfitUsdt });
+        return jsonRes({ ok: true, status: credited ? "credited" : "duplicate", tx_id: txId, user_share_usdt: userShareUsdt, admin_profit_usdt: adminProfitUsdt }, 200, req);
       } catch (e: any) {
-        return jsonRes({ error: e?.message || "Postback error" }, 400);
+        return jsonRes({ error: e?.message || "Postback error" }, 400, req);
       }
     }
 
@@ -1882,13 +1917,13 @@ async function routeRequest(req: Request): Promise<Response> {
       const table = path.replace("/api/table/", "");
       if (table === "public_withdraw_config") {
         const [wdCfg, rule] = await Promise.all([getCachedWithdrawConfig(), getCachedWithdrawRule()]);
-        return jsonRes({ data: wdCfg ? { ...wdCfg, withdraw_rule: rule } : { amounts: [], chart: {}, amount_conditions: [], withdraw_rule: rule } });
+        return jsonRes({ data: wdCfg ? { ...wdCfg, withdraw_rule: rule } : { amounts: [], chart: {}, amount_conditions: [], withdraw_rule: rule } }, 200, req);
       }
       if (table === "compounding_settings") {
-        return jsonRes({ data: await getCachedCompoundingSettings() });
+        return jsonRes({ data: await getCachedCompoundingSettings() }, 200, req);
       }
       if (table === "monetization_settings") {
-        return jsonRes({ data: await getCachedMonetizationPublic() });
+        return jsonRes({ data: await getCachedMonetizationPublic() }, 200, req);
       }
       if (table === "profiles") {
         const user = await authenticateRequest(req);
@@ -1996,26 +2031,30 @@ const server = Bun.serve({
   port: PORT,
   async fetch(req: Request): Promise<Response> {
     const res = await routeRequest(req);
+    const reqOrigin = req.headers.get("origin") || "";
+    const headers = new Headers(res.headers);
+    if (reqOrigin && isAllowedOrigin(reqOrigin)) {
+      headers.set("Access-Control-Allow-Origin", reqOrigin);
+    }
     const ae = req.headers.get("accept-encoding") || "";
-    const ct = res.headers.get("content-type") || "";
-    const cl = Number(res.headers.get("content-length") || 0);
+    const ct = headers.get("content-type") || "";
+    const cl = Number(headers.get("content-length") || 0);
     if (
       ae.includes("gzip") &&
-      !res.headers.has("content-encoding") &&
+      !headers.has("content-encoding") &&
       (ct.includes("image/svg+xml") || (ct.includes("application/json") && (cl === 0 || cl >= 1024)))
     ) {
       const raw = new Uint8Array(await res.arrayBuffer());
       if (raw.byteLength >= 1024) {
         const gz = gzipSync(raw, { level: 4 });
-        const headers = new Headers(res.headers);
         headers.set("Content-Encoding", "gzip");
-        headers.set("Vary", "Accept-Encoding");
+        headers.set("Vary", "Origin, Accept-Encoding");
         headers.delete("Content-Length");
         return new Response(gz, { status: res.status, headers });
       }
-      return new Response(raw, { status: res.status, headers: res.headers });
+      return new Response(raw, { status: res.status, headers });
     }
-    return res;
+    return new Response(res.body, { status: res.status, headers });
   },
 });
 
@@ -2480,19 +2519,25 @@ async function handleUserFinance(action: string, body: Record<string, any>, user
     }
 
     if (action === "create_deposit") {
-      const amt = Number(body.amount_usdt);
+      if (!(await checkRateLimit(`rl:dep:${user.id}`, 10, 60))) {
+        return jsonRes({ error: "Too many deposit requests. Please wait a minute." }, 429);
+      }
+      const amt = Math.round(Number(body.amount_usdt) * 10000) / 10000;
       const txId = String(body.tx_id || "").trim();
-      if (!Number.isFinite(amt) || amt < 1) return jsonRes({ error: "Minimum deposit is 1 USDT." }, 400);
-      if (txId.length < 4) return jsonRes({ error: "Enter valid transaction ID." }, 400);
+      if (!Number.isFinite(amt) || amt < 1 || amt > 1_000_000) return jsonRes({ error: "Deposit amount must be between 1 and 1,000,000 USDT." }, 400);
+      if (txId.length < 4 || txId.length > 140) return jsonRes({ error: "Enter valid transaction ID." }, 400);
       await sql`insert into public.deposits (user_id, amount_usdt, tx_id, status) values (${user.id}, ${amt}, ${txId}, 'pending')`;
       return jsonRes({ message: "Deposit request submitted for admin approval." });
     }
 
     if (action === "request_withdrawal") {
+      if (!(await checkRateLimit(`rl:wd:${user.id}`, 10, 60))) {
+        return jsonRes({ error: "Too many withdrawal requests. Please wait a minute." }, 429);
+      }
       await flushPendingCaptchas();
-      const amt = Number(body.amount_usdt);
+      const amt = Math.round(Number(body.amount_usdt) * 10000) / 10000;
       const addr = String(body.wallet_address || "").trim();
-      if (!Number.isFinite(amt) || amt <= 0) return jsonRes({ error: "Invalid withdrawal amount." }, 400);
+      if (!Number.isFinite(amt) || amt < 0.01 || amt > 1_000_000) return jsonRes({ error: "Invalid withdrawal amount." }, 400);
       if (!/^0x[a-fA-F0-9]{40}$/.test(addr)) return jsonRes({ error: "Invalid BEP-20 wallet address." }, 400);
       if (!(await verifyTurnstile(body.captchaToken))) {
         return jsonRes({ error: "Cloudflare human verification failed. Please verify again." }, 400);
@@ -2504,6 +2549,12 @@ async function handleUserFinance(action: string, body: Record<string, any>, user
         sql`select coalesce(sum(amount_usdt), 0) as total from public.deposits where user_id = ${user.id} and status = 'approved'`,
         sql`select count(*)::integer as cnt from public.withdrawal_requests where user_id = ${user.id} and (created_at at time zone 'Asia/Kolkata')::date = (now() at time zone 'Asia/Kolkata')::date`,
       ]);
+      const allowedAmounts = Array.isArray(wdCfg?.amounts)
+        ? wdCfg.amounts.map((x: any) => Math.round(Number(x) * 10000) / 10000).filter((x: number) => Number.isFinite(x) && x > 0)
+        : [];
+      if (allowedAmounts.length > 0 && !allowedAmounts.includes(amt)) {
+        return jsonRes({ error: "Select a valid configured withdrawal amount." }, 400);
+      }
       const depUsdt = Number(depRows[0]?.total || 0);
       const chart = wdCfg?.chart && !Array.isArray(wdCfg.chart) ? wdCfg.chart : {};
       const dailyLimit = Number(chart.daily_limit ?? 2);
@@ -2517,7 +2568,7 @@ async function handleUserFinance(action: string, body: Record<string, any>, user
           return jsonRes({ error: `Minimum ${rule.min_deposit_usdt} USDT approved deposit required before withdrawal.` }, 400);
         }
         const amtConds = Array.isArray(wdCfg?.amount_conditions) ? wdCfg.amount_conditions : [];
-        const matched = amtConds.find((c: any) => Number(c?.amount) === amt);
+        const matched = amtConds.find((c: any) => Math.round(Number(c?.amount) * 10000) / 10000 === amt);
         const reqPct = Math.max(0, Number(chart.deposit_percent ?? 40));
         reqDep = matched ? Math.max(0, Number(matched.deposit || 0)) : Math.round(amt * (reqPct / 100) * 100) / 100;
         if (reqDep > 0 && depUsdt < reqDep) {
@@ -2526,7 +2577,8 @@ async function handleUserFinance(action: string, body: Record<string, any>, user
       }
 
       await sql.begin(async (tx: any) => {
-        const [prof] = await tx`select balance_usdt from public.profiles where id = ${user.id} for update`;
+        const [prof] = await tx`select balance_usdt, account_status from public.profiles where id = ${user.id} for update`;
+        if (prof?.account_status === "blocked") throw new Error("Account is blocked by admin.");
         if (Number(prof?.balance_usdt || 0) < amt) throw new Error("Insufficient wallet balance.");
         await tx`
           insert into public.wallet_ledger (user_id, entry_type, amount, description)
@@ -2616,19 +2668,27 @@ async function handleUserFinance(action: string, body: Record<string, any>, user
     if (action === "compounding_early_exit") {
       const settings = await getCachedCompoundingSettings();
       if (!settings?.early_exit_enabled) return jsonRes({ error: "Early exit disabled by admin." }, 403);
-      const [plan] = await sql`
-        select * from public.compounding_plans
-        where id = ${Number(body.plan_id)} and user_id = ${user.id} and status in ('active', 'paused')
-      `;
-      if (!plan) return jsonRes({ error: "Active plan not found." }, 404);
-      const baseInr = plan.credit_mode === "daily_to_main_wallet" ? Number(plan.principal_inr) : Number(plan.current_balance_inr);
-      const payoutInr = Math.round(baseInr * (1 - Number(settings.early_exit_penalty_pct) / 100) * 100) / 100;
-      const payoutUsdt = Math.round((payoutInr / USDT_INR_RATE) * 10000) / 10000;
-      await sql`update public.compounding_plans set status = 'cancelled', matured_at = now() where id = ${plan.id}`;
-      await sql`
-        insert into public.wallet_ledger (user_id, entry_type, amount, description)
-        values (${user.id}, 'compounding_maturity', ${payoutUsdt}, ${`Plan #${plan.id} early exit (₹${payoutInr})`})
-      `;
+      const planId = Number(body.plan_id);
+      if (!Number.isInteger(planId) || planId <= 0) return jsonRes({ error: "Invalid plan ID." }, 400);
+      const payoutInr = await sql.begin(async (tx: any) => {
+        const [plan] = await tx`
+          update public.compounding_plans
+          set status = 'cancelled', matured_at = now()
+          where id = ${planId} and user_id = ${user.id} and status in ('active', 'paused')
+          returning *
+        `;
+        if (!plan) throw new Error("Active plan not found.");
+        const baseInr = plan.credit_mode === "daily_to_main_wallet" ? Number(plan.principal_inr) : Number(plan.current_balance_inr);
+        const calcInr = Math.round(baseInr * (1 - Number(settings.early_exit_penalty_pct) / 100) * 100) / 100;
+        const payoutUsdt = Math.round((calcInr / USDT_INR_RATE) * 10000) / 10000;
+        if (payoutUsdt > 0) {
+          await tx`
+            insert into public.wallet_ledger (user_id, entry_type, amount, description)
+            values (${user.id}, 'compounding_maturity', ${payoutUsdt}, ${`Plan #${plan.id} early exit (₹${calcInr})`})
+          `;
+        }
+        return calcInr;
+      });
       return jsonRes({ message: `Plan closed. ₹${payoutInr.toLocaleString("en-IN")} credited.` });
     }
 
