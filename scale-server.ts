@@ -676,7 +676,7 @@ async function ensureMonetizationTables() {
         ad_script_url text default '',
         ad_container_id text default '',
         direct_link_url text default '',
-        direct_link_label text default '🎁 Sponsored Offer — Check Now',
+        direct_link_label text default 'Sponsored Partner',
         offerwall_enabled boolean not null default false,
         offerwall_name text default 'Offerwall Tasks',
         offerwall_url text default '',
@@ -684,11 +684,15 @@ async function ensureMonetizationTables() {
         postback_secret text not null default '',
         ad_mediation_mode text not null default 'highest_cpm_fallback',
         ad_networks_json jsonb not null default '[]'::jsonb,
+        ad_safe_mode boolean not null default true,
+        public_ads_enabled boolean not null default true,
         updated_at timestamptz not null default now()
       )
     `;
     await sql`alter table public.monetization_settings add column if not exists ad_mediation_mode text not null default 'highest_cpm_fallback'`;
     await sql`alter table public.monetization_settings add column if not exists ad_networks_json jsonb not null default '[]'::jsonb`;
+    await sql`alter table public.monetization_settings add column if not exists ad_safe_mode boolean not null default true`;
+    await sql`alter table public.monetization_settings add column if not exists public_ads_enabled boolean not null default true`;
     const randSecret = randomCode(24);
     await sql`
       insert into public.monetization_settings (id, postback_secret)
@@ -1411,12 +1415,12 @@ async function getCachedMonetizationPublic() {
   return await getCachedConfigRow(
     "cache:monetization_public",
     () => sql`
-      select ads_enabled, top_banner_img, top_banner_link, ad_script_url, ad_container_id,
+      select ads_enabled, public_ads_enabled, ad_safe_mode, top_banner_img, top_banner_link, ad_script_url, ad_container_id,
              direct_link_url, direct_link_label, offerwall_enabled, offerwall_name,
              offerwall_url, user_share_pct, ad_mediation_mode, ad_networks_json
       from public.monetization_settings where id = 1
     `,
-    { ads_enabled: false, offerwall_enabled: false, user_share_pct: 60, ad_mediation_mode: "highest_cpm_fallback", ad_networks_json: [] }
+    { ads_enabled: false, public_ads_enabled: true, ad_safe_mode: true, offerwall_enabled: false, user_share_pct: 60, ad_mediation_mode: "highest_cpm_fallback", ad_networks_json: [] }
   );
 }
 
@@ -1783,7 +1787,7 @@ async function routeRequest(req: Request): Promise<Response> {
     if (path === "/health" || path === "/") {
       try {
         await Promise.all([sql`select 1`, redis.ping()]);
-        return jsonRes({ ok: true, status: "healthy", mode: "hetzner-standalone", version: "2026-11-27-ui-wd-success-v5" }, 200, req);
+        return jsonRes({ ok: true, status: "healthy", mode: "hetzner-standalone", version: "2026-11-28-ads-safe-v6" }, 200, req);
       } catch (e: any) {
         return jsonRes({ ok: false, error: e?.message || "unhealthy" }, 503, req);
       }
@@ -3924,7 +3928,9 @@ async function handleAdminControl(
       const adScriptUrl = isSafeHttpsUrl(body.ad_script_url);
       const adContainerId = String(body.ad_container_id || "").trim().replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 80);
       const directLinkUrl = isSafeHttpsUrl(body.direct_link_url);
-      const directLinkLabel = String(body.direct_link_label || "🎁 Sponsored Offer — Check Now").trim().slice(0, 80);
+      const directLinkLabel = String(body.direct_link_label || "Sponsored Partner").trim().slice(0, 80);
+      const adSafeMode = body.ad_safe_mode !== false;
+      const publicAdsEnabled = body.public_ads_enabled !== false;
       const offerwallName = String(body.offerwall_name || "Offerwall Tasks").trim().slice(0, 60);
       const offerwallUrl = isSafeHttpsUrl(body.offerwall_url);
       const sharePct = Number(body.user_share_pct ?? 60);
@@ -3959,6 +3965,8 @@ async function handleAdminControl(
       await sql`
         update public.monetization_settings set
           ads_enabled = ${Boolean(body.ads_enabled)},
+          ad_safe_mode = ${adSafeMode},
+          public_ads_enabled = ${publicAdsEnabled},
           top_banner_img = ${topBannerImg},
           top_banner_link = ${topBannerLink},
           ad_script_url = ${adScriptUrl},
@@ -3975,7 +3983,7 @@ async function handleAdminControl(
         where id = 1
       `;
       await redis.del("cache:monetization_public");
-      return jsonRes({ message: "Ads, Auto High-CPM Mediation & Offerwall settings saved." });
+      return jsonRes({ message: "Ads-Safe Mode, Auto High-CPM Mediation & Offerwall settings saved." });
     }
     if (action === "rotate_postback_secret") {
       const nextSecret = randomCode(24);
