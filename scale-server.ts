@@ -319,16 +319,23 @@ function randomCode(len = 6): string {
 }
 
 function renderCaptchaSvg(code: string): string {
+  const len = Math.max(1, code.length);
+  const step = 28;
+  const svgWidth = Math.max(200, len * step + 36);
+  const svgHeight = 60;
+  const startX = (svgWidth - (len - 1) * step) / 2;
   const letters = code
     .split("")
     .map((ch, idx) => {
-      const x = 22 + idx * 28;
-      const y = 38 + (idx % 2 === 0 ? -1 : 1) * ((ch.charCodeAt(0) % 7) + 2);
+      const x = Math.round(startX + idx * step);
+      const y = 37 + (idx % 2 === 0 ? -1 : 1) * ((ch.charCodeAt(0) % 6) + 2);
       const rot = (ch.charCodeAt(0) % 24) - 12;
-      return `<text x="${x}" y="${y}" font-family="monospace" font-size="28" font-weight="800" fill="#e2e8f0" transform="rotate(${rot} ${x} ${y})">${ch}</text>`;
+      return `<text x="${x}" y="${y}" text-anchor="middle" font-family="monospace" font-size="27" font-weight="800" fill="#e2e8f0" transform="rotate(${rot} ${x} ${y})">${ch}</text>`;
     })
     .join("");
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="200" height="58" viewBox="0 0 200 58"><rect width="200" height="58" rx="10" fill="#0f172a"/><path d="M8 18 Q 95 45, 192 14" stroke="#38bdf8" stroke-opacity="0.35" stroke-width="2" fill="none"/><path d="M12 44 Q 110 8, 188 42" stroke="#f472b6" stroke-opacity="0.35" stroke-width="2" fill="none"/>${letters}</svg>`;
+  const q1x = Math.round(svgWidth * 0.48);
+  const q2x = Math.round(svgWidth * 0.55);
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${svgWidth}" height="${svgHeight}" viewBox="0 0 ${svgWidth} ${svgHeight}"><rect width="${svgWidth}" height="${svgHeight}" rx="10" fill="#0f172a"/><path d="M8 18 Q ${q1x} 45, ${svgWidth - 8} 14" stroke="#38bdf8" stroke-opacity="0.35" stroke-width="2" fill="none"/><path d="M12 44 Q ${q2x} 8, ${svgWidth - 12} 42" stroke="#f472b6" stroke-opacity="0.35" stroke-width="2" fill="none"/>${letters}</svg>`;
 }
 
 function calcProjectedBalance(principalInr: number, dailyRatePct: number, days: number): number {
@@ -1504,7 +1511,7 @@ async function isUserAdmin(user: { id: string; email: string; role: string }): P
 async function verifyAuthSecCaptcha(token: unknown, code: unknown): Promise<boolean> {
   const v = await verifyCaptchaToken(String(token || ""));
   if (!v || v.purpose !== "auth") return false;
-  if (String(code || "").trim().toUpperCase() !== String(v.code || "").toUpperCase()) return false;
+  if (String(code || "").replace(/\s+/g, "").toUpperCase() !== String(v.code || "").toUpperCase()) return false;
   const used = await redis.set(`auth_cap_used:${v.nid}`, "1", "EX", 240, "NX");
   return Boolean(used);
 }
@@ -1822,7 +1829,7 @@ async function routeRequest(req: Request): Promise<Response> {
     if (path === "/health" || path === "/") {
       try {
         await Promise.all([sql`select 1`, redis.ping()]);
-        return jsonRes({ ok: true, status: "healthy", mode: "hetzner-standalone", version: "2026-11-28-sec-hardened-v7" }, 200, req);
+        return jsonRes({ ok: true, status: "healthy", mode: "hetzner-standalone", version: "2026-11-28-captcha-fit-v8" }, 200, req);
       } catch (e: any) {
         return jsonRes({ ok: false, error: e?.message || "unhealthy" }, 503, req);
       }
@@ -2235,7 +2242,7 @@ async function handleUserFinance(action: string, body: Record<string, any>, user
         });
       }
 
-      if (String(body.answer || "").trim().toUpperCase() !== String(verified.code).toUpperCase()) {
+      if (String(body.answer || "").replace(/\s+/g, "").toUpperCase() !== String(verified.code).toUpperCase()) {
         const next = await issueCaptchaChallenge(user.id);
         return jsonRes({ ok: false, today_passed: state.todayPassed, captcha_daily_limit: limit, next });
       }
